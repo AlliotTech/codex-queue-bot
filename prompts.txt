@@ -1,0 +1,66 @@
+# Lightweight engineering prompts
+# One prompt per line. Empty lines and lines beginning with # are ignored.
+
+# Engineering prompts
+Review this Python function for potential bugs and suggest improvements: def merge_dicts(a, b): return {**a, **b}
+Explain the difference between an array and a linked list, and when to use each
+Write a one-line bash command to find the 5 largest files in a directory tree
+What is the time complexity of binary search? Explain in one sentence
+Find the bug: for i in range(len(arr)): arr.remove(arr[i])
+Write a regex that matches valid IPv4 addresses
+Explain what CORS is and why it matters for web applications
+What does 'git rebase -i HEAD~3' do? Explain briefly
+Write a Python one-liner to flatten a list of lists
+Explain the difference between TCP and UDP in networking
+What is a race condition? Give a minimal example in Python
+Write a bash one-liner to count unique IPs in an nginx access log
+Explain what a closure is in JavaScript with a short example
+What is the difference between INNER JOIN and LEFT JOIN in SQL?
+Write a Python generator that yields Fibonacci numbers indefinitely
+Explain what idempotency means in the context of REST APIs
+What is the CAP theorem? Explain in 2-3 sentences
+Write a grep pattern to find all TODO comments in a codebase (excluding strings)
+Explain the concept of memoization with a short Python example
+What is the difference between a shallow copy and a deep copy in Python?
+Write a SQL query to find duplicate emails in a users table
+Explain what a symbolic link is and how to create one in Linux
+What is the purpose of __init__.py in Python packages?
+Write a Python list comprehension to get all even numbers from 1 to 20
+Explain the difference between authorization and authentication
+What does 'chmod 755' mean in Linux? Break down the permission bits
+Write a Python context manager pattern using a 'with' statement
+Explain what ACID stands for in database transactions
+What is the difference between 'git merge' and 'git rebase'?
+Write a sed command to replace all tabs with 4 spaces in a file
+
+# Very short prompts
+What is 2 + 2?
+Write a bash one-liner to print "hello world"
+What does the `cat` command do?
+How many bits are in a byte?
+Write a Python one-liner to square a number
+What is the capital of Japan?
+What does `pwd` do in Linux?
+Write a JavaScript one-liner to get the current time
+What is 15 * 3?
+What does the `whoami` command do?
+Write a Python one-liner to reverse a list
+What is the boiling point of water in Celsius?
+What does `head -n 5` do?
+Write a bash one-liner to count lines in a file
+What is 144 divided by 12?
+What does the `touch` command do?
+Write a Python one-liner to check if a string is empty
+What is the square root of 64?
+What does `tail -f` do?
+Write a JavaScript one-liner to generate a random number
+What is 7 * 8?
+What does the `mkdir -p` command do?
+Write a Python one-liner to convert a string to uppercase
+How many seconds are in an hour?
+What does `grep -c` do?
+Write a bash one-liner to list all .txt files
+What is 2^10?
+What does the `sort -r` command do?
+Write a Python one-liner to get the length of a list
+What is the atomic number of oxygen?

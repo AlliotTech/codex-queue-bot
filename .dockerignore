@@ -1,0 +1,16 @@
+.git
+.github
+.env*
+config.json
+config.*.json
+openilink-tools.json
+codex-queue-bot
+*.log
+*.pid
+.codex
+secrets
+credentials
+*.pem
+*.key
+*.p12
+*.pfx

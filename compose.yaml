@@ -1,0 +1,15 @@
+name: codex-queue-bot
+
+services:
+  codex-queue-bot:
+    image: ${CODEX_QUEUE_BOT_IMAGE:-ghcr.io/alliottech/codex-queue-bot:latest}
+    pull_policy: always
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./prompts.txt:/app/prompts.txt:ro

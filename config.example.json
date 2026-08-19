@@ -1,0 +1,37 @@
+{
+  "openilink": {
+    "base_url": "https://hub.example.com",
+    "token_env": "OPENILINK_APP_TOKEN",
+    "allowed_user_ids": [
+      "wxid_your_user_id"
+    ],
+    "http_timeout_seconds": 15
+  },
+  "codex": {
+    "binary": "codex",
+    "prompts_file": "prompts.txt",
+    "request_timeout_seconds": 180,
+    "retry_min_seconds": 3,
+    "retry_max_seconds": 8,
+    "max_parallel": 2,
+    "success_message": "开蹬",
+    "reasoning_effort": "low",
+    "config_overrides": [],
+    "targets": [
+      {
+        "name": "primary",
+        "api_base_url": "https://codex-a.example.com/v1",
+        "api_key_env": "CODEX_KEY_PRIMARY",
+        "model": "gpt-5.2-codex",
+        "wire_api": "responses"
+      },
+      {
+        "name": "backup",
+        "api_base_url": "https://codex-b.example.com/v1",
+        "api_key_env": "CODEX_KEY_BACKUP",
+        "model": "gpt-5.2-codex",
+        "wire_api": "responses"
+      }
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+[
+  {
+    "name": "start_codex_queue",
+    "description": "启动一个或全部 Codex API 目标的排队请求",
+    "command": "开挤"
+  },
+  {
+    "name": "codex_queue_status",
+    "description": "查看 Codex API 目标的排队状态",
+    "command": "状态"
+  },
+  {
+    "name": "stop_codex_queue",
+    "description": "停止一个或全部 Codex API 目标的排队请求",
+    "command": "停止"
+  },
+  {
+    "name": "list_codex_targets",
+    "description": "列出已配置的 Codex API 目标",
+    "command": "列表"
+  },
+  {
+    "name": "codex_queue_help",
+    "description": "显示 Codex 排队机器人的帮助",
+    "command": "帮助"
+  }
+]
