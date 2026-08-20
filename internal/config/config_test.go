@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadAppliesDefaultsAndResolvesSecrets(t *testing.T) {
@@ -52,6 +53,90 @@ func TestLoadAppliesDefaultsAndResolvesSecrets(t *testing.T) {
 	if cfg.Codex.RetryMinSecond != defaultRetryMin || cfg.Codex.RetryMaxSecond != defaultRetryMax {
 		t.Fatalf("retry defaults = %d-%d", cfg.Codex.RetryMinSecond, cfg.Codex.RetryMaxSecond)
 	}
+	if cfg.Codex.KeepaliveMinSecond != defaultKeepaliveMin || cfg.Codex.KeepaliveMaxSecond != defaultKeepaliveMax {
+		t.Fatalf("keepalive defaults = %d-%d", cfg.Codex.KeepaliveMinSecond, cfg.Codex.KeepaliveMaxSecond)
+	}
+	if cfg.KeepaliveMin() != 2700*time.Second || cfg.KeepaliveMax() != 3300*time.Second {
+		t.Fatalf("keepalive durations = %s-%s", cfg.KeepaliveMin(), cfg.KeepaliveMax())
+	}
+}
+
+func TestLoadKeepaliveInterval(t *testing.T) {
+	t.Setenv("TEST_HUB_TOKEN", "hub-secret")
+	t.Setenv("TEST_CODEX_KEY", "codex-secret")
+	tests := []struct {
+		name    string
+		fields  string
+		wantMin int
+		wantMax int
+	}{
+		{name: "explicit", fields: `"keepalive_min_seconds": 12, "keepalive_max_seconds": 34,`, wantMin: 12, wantMax: 34},
+		{name: "explicit zero uses defaults", fields: `"keepalive_min_seconds": 0, "keepalive_max_seconds": 0,`, wantMin: defaultKeepaliveMin, wantMax: defaultKeepaliveMax},
+		{name: "zero minimum only", fields: `"keepalive_min_seconds": 0, "keepalive_max_seconds": 3000,`, wantMin: defaultKeepaliveMin, wantMax: 3000},
+		{name: "zero maximum only", fields: `"keepalive_min_seconds": 3000, "keepalive_max_seconds": 0,`, wantMin: 3000, wantMax: defaultKeepaliveMax},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			data := `{
+  "openilink": {"base_url": "https://hub.example.com", "token_env": "TEST_HUB_TOKEN"},
+  "codex": {
+    ` + tt.fields + `
+    "targets": [
+      {"name": "main", "api_base_url": "https://api.example.com/v1", "api_key_env": "TEST_CODEX_KEY", "model": "gpt-test"}
+    ]
+  }
+}`
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Codex.KeepaliveMinSecond != tt.wantMin || cfg.Codex.KeepaliveMaxSecond != tt.wantMax {
+				t.Fatalf("keepalive interval = %d-%d, want %d-%d", cfg.Codex.KeepaliveMinSecond, cfg.Codex.KeepaliveMaxSecond, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInvalidKeepaliveInterval(t *testing.T) {
+	base := Config{
+		OpenILink: OpenILinkConfig{BaseURL: "https://hub.example.com", Token: "x", HTTPTimeoutSecond: 1},
+		Codex: CodexConfig{
+			Binary:               "codex",
+			RequestTimeoutSecond: 1,
+			RetryMinSecond:       1,
+			RetryMaxSecond:       1,
+			KeepaliveMinSecond:   1,
+			KeepaliveMaxSecond:   1,
+			MaxParallel:          1,
+			Targets: []Target{
+				{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"},
+			},
+		},
+	}
+	tests := []struct {
+		name string
+		min  int
+		max  int
+		want string
+	}{
+		{name: "minimum below one", min: -1, max: 1, want: "at least 1 second"},
+		{name: "maximum below one", min: 1, max: -1, want: "at least 1 second"},
+		{name: "reversed", min: 2, max: 1, want: "keepalive_min_seconds must be <= keepalive_max_seconds"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			cfg.Codex.KeepaliveMinSecond = tt.min
+			cfg.Codex.KeepaliveMaxSecond = tt.max
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
 }
 
 func TestLoadRejectsUnknownFieldAndTrailingJSON(t *testing.T) {
@@ -93,6 +178,8 @@ func TestValidateRejectsDuplicateAndUnaddressableTargetNames(t *testing.T) {
 			RequestTimeoutSecond: 1,
 			RetryMinSecond:       1,
 			RetryMaxSecond:       1,
+			KeepaliveMinSecond:   1,
+			KeepaliveMaxSecond:   1,
 			MaxParallel:          1,
 		},
 	}

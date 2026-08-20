@@ -13,6 +13,8 @@
     "request_timeout_seconds": 180,
     "retry_min_seconds": 3,
     "retry_max_seconds": 8,
+    "keepalive_min_seconds": 2700,
+    "keepalive_max_seconds": 3300,
     "max_parallel": 2,
     "success_message": "开蹬",
     "reasoning_effort": "low",

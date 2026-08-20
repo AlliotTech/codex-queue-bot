@@ -52,6 +52,12 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 		response = h.stop(targets)
 	case "状态", "status":
 		response = h.status(targets)
+	case "保活", "keepalive":
+		response = h.startKeepalive(targets)
+	case "停止保活", "stop-keepalive":
+		response = h.stopKeepalive(targets)
+	case "保活状态", "keepalive-status":
+		response = h.keepaliveStatus(targets)
 	case "列表", "目标", "list", "targets":
 		response = h.list()
 	case "帮助", "help":
@@ -98,12 +104,64 @@ func (h *Handler) stop(targets []string) string {
 	return strings.Join(parts, "\n")
 }
 
+func (h *Handler) startKeepalive(targets []string) string {
+	result := h.manager.StartKeepalive(targets)
+	parts := make([]string, 0, 3)
+	if len(result.Started) > 0 {
+		parts = append(parts, "已开始保活："+strings.Join(result.Started, "、"))
+	}
+	if len(result.Already) > 0 {
+		parts = append(parts, "正在保活："+strings.Join(result.Already, "、"))
+	}
+	if len(result.Unknown) > 0 {
+		parts = append(parts, "未知目标："+strings.Join(result.Unknown, "、"))
+	}
+	if len(parts) == 0 {
+		return "没有可启动保活的目标。"
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (h *Handler) stopKeepalive(targets []string) string {
+	result := h.manager.StopKeepalive(targets)
+	parts := make([]string, 0, 3)
+	if len(result.Stopped) > 0 {
+		parts = append(parts, "已停止保活："+strings.Join(result.Stopped, "、"))
+	}
+	if len(result.Inactive) > 0 {
+		parts = append(parts, "未在保活："+strings.Join(result.Inactive, "、"))
+	}
+	if len(result.Unknown) > 0 {
+		parts = append(parts, "未知目标："+strings.Join(result.Unknown, "、"))
+	}
+	if len(parts) == 0 {
+		return "没有可停止保活的目标。"
+	}
+	return strings.Join(parts, "\n")
+}
+
 func (h *Handler) status(targets []string) string {
 	snapshots, unknown := h.manager.Snapshots(targets)
 	lines := make([]string, 0, len(snapshots)+1)
 	now := time.Now()
 	for _, snapshot := range snapshots {
 		lines = append(lines, formatSnapshot(snapshot, now))
+	}
+	if len(unknown) > 0 {
+		lines = append(lines, "未知目标："+strings.Join(unknown, "、"))
+	}
+	if len(lines) == 0 {
+		return "没有匹配的目标。"
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func (h *Handler) keepaliveStatus(targets []string) string {
+	snapshots, unknown := h.manager.KeepaliveSnapshots(targets)
+	lines := make([]string, 0, len(snapshots)+1)
+	now := time.Now()
+	for _, snapshot := range snapshots {
+		lines = append(lines, formatKeepaliveSnapshot(snapshot, now))
 	}
 	if len(unknown) > 0 {
 		lines = append(lines, "未知目标："+strings.Join(unknown, "、"))
@@ -208,6 +266,32 @@ func formatSnapshot(snapshot jobs.Snapshot, now time.Time) string {
 	}
 }
 
+func formatKeepaliveSnapshot(snapshot jobs.KeepaliveSnapshot, now time.Time) string {
+	prefix := snapshot.Name + "："
+	var value string
+	switch snapshot.State {
+	case jobs.KeepaliveStateRequesting:
+		value = fmt.Sprintf("请求中（共请求 %d 次）", snapshot.Requests)
+	case jobs.KeepaliveStateWaitingQueue:
+		value = fmt.Sprintf("等待排队任务结束（共请求 %d 次）", snapshot.Requests)
+	case jobs.KeepaliveStateWaitingNext:
+		value = fmt.Sprintf("等待下次请求（共请求 %d 次）", snapshot.Requests)
+		if !snapshot.NextRequest.IsZero() {
+			value += "，下次约 " + relativeFuture(snapshot.NextRequest, now)
+		}
+	default:
+		value = fmt.Sprintf("已停止（共请求 %d 次）", snapshot.Requests)
+	}
+	if !snapshot.LastFailure.IsZero() {
+		errorText := snapshot.LastError
+		if errorText == "" {
+			errorText = "无错误详情"
+		}
+		value += "\n\n最近失败：" + truncate(errorText, 100)
+	}
+	return prefix + value
+}
+
 func relativeFuture(at, now time.Time) string {
 	remaining := at.Sub(now).Round(time.Second)
 	if remaining <= 0 {
@@ -239,8 +323,12 @@ func helpText() string {
 		"/开挤 [目标|all] — 开始请求；不写目标则全部启动\n",
 		"/状态 [目标] — 查看尝试次数、最近错误和下次重试\n",
 		"/停止 [目标|all] — 停止任务\n",
+		"/保活 [目标|all] — 启动随机间隔保活\n",
+		"/保活状态 [目标] — 查看保活次数、阶段和最近失败\n",
+		"/停止保活 [目标|all] — 停止保活\n",
 		"/列表 — 查看已配置的 Key/API 目标\n",
 		"/帮助 — 显示本帮助\n",
-		"多个目标可用空格或逗号分隔。",
+		"多个目标可用空格或逗号分隔。\n",
+		"英文别名：/start、/status、/stop、/keepalive、/keepalive-status、/stop-keepalive、/list、/help。",
 	}, "\n")
 }

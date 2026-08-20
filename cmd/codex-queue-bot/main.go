@@ -81,6 +81,8 @@ func main() {
 		logger,
 		cfg.RetryMin(),
 		cfg.RetryMax(),
+		cfg.KeepaliveMin(),
+		cfg.KeepaliveMax(),
 		cfg.Codex.MaxParallel,
 		cfg.Codex.SuccessMessage,
 	)
@@ -92,6 +94,8 @@ func main() {
 		"openilink", cfg.OpenILink.BaseURL,
 		"targets", strings.Join(manager.TargetNames(), ","),
 		"max_parallel", cfg.Codex.MaxParallel,
+		"keepalive_min", cfg.KeepaliveMin(),
+		"keepalive_max", cfg.KeepaliveMax(),
 	)
 	if err := hubClient.Run(ctx, handler.Handle); err != nil {
 		logger.Error("OpenILink listener stopped", "error", err)

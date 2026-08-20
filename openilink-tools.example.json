@@ -15,6 +15,21 @@
     "command": "停止"
   },
   {
+    "name": "start_codex_keepalive",
+    "description": "启动一个或全部 Codex API 目标的随机间隔保活",
+    "command": "保活"
+  },
+  {
+    "name": "codex_keepalive_status",
+    "description": "查看 Codex API 目标的保活状态",
+    "command": "保活状态"
+  },
+  {
+    "name": "stop_codex_keepalive",
+    "description": "停止一个或全部 Codex API 目标的保活",
+    "command": "停止保活"
+  },
+  {
     "name": "list_codex_targets",
     "description": "列出已配置的 Codex API 目标",
     "command": "列表"

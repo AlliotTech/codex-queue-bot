@@ -20,6 +20,8 @@ const (
 	defaultRequestTimeout   = 180
 	defaultRetryMin         = 3
 	defaultRetryMax         = 8
+	defaultKeepaliveMin     = 2700
+	defaultKeepaliveMax     = 3300
 	defaultMaxParallel      = 2
 	defaultSuccessMessage   = "开蹬"
 	defaultReasoningEffort  = "low"
@@ -47,6 +49,8 @@ type CodexConfig struct {
 	RequestTimeoutSecond int      `json:"request_timeout_seconds,omitempty"`
 	RetryMinSecond       int      `json:"retry_min_seconds,omitempty"`
 	RetryMaxSecond       int      `json:"retry_max_seconds,omitempty"`
+	KeepaliveMinSecond   int      `json:"keepalive_min_seconds,omitempty"`
+	KeepaliveMaxSecond   int      `json:"keepalive_max_seconds,omitempty"`
 	MaxParallel          int      `json:"max_parallel,omitempty"`
 	SuccessMessage       string   `json:"success_message,omitempty"`
 	ReasoningEffort      string   `json:"reasoning_effort,omitempty"`
@@ -123,6 +127,12 @@ func (c *Config) applyDefaults(configDir string) {
 	if c.Codex.RetryMaxSecond == 0 {
 		c.Codex.RetryMaxSecond = defaultRetryMax
 	}
+	if c.Codex.KeepaliveMinSecond == 0 {
+		c.Codex.KeepaliveMinSecond = defaultKeepaliveMin
+	}
+	if c.Codex.KeepaliveMaxSecond == 0 {
+		c.Codex.KeepaliveMaxSecond = defaultKeepaliveMax
+	}
 	if c.Codex.MaxParallel == 0 {
 		c.Codex.MaxParallel = defaultMaxParallel
 	}
@@ -187,6 +197,12 @@ func (c *Config) Validate() error {
 	if c.Codex.RetryMinSecond > c.Codex.RetryMaxSecond {
 		return errors.New("codex.retry_min_seconds must be <= retry_max_seconds")
 	}
+	if c.Codex.KeepaliveMinSecond < minimumRetryIntervalSec || c.Codex.KeepaliveMaxSecond < minimumRetryIntervalSec {
+		return fmt.Errorf("codex keepalive interval must be at least %d second", minimumRetryIntervalSec)
+	}
+	if c.Codex.KeepaliveMinSecond > c.Codex.KeepaliveMaxSecond {
+		return errors.New("codex.keepalive_min_seconds must be <= keepalive_max_seconds")
+	}
 	if c.Codex.MaxParallel <= 0 {
 		return errors.New("codex.max_parallel must be positive")
 	}
@@ -245,6 +261,14 @@ func (c *Config) RetryMin() time.Duration {
 
 func (c *Config) RetryMax() time.Duration {
 	return time.Duration(c.Codex.RetryMaxSecond) * time.Second
+}
+
+func (c *Config) KeepaliveMin() time.Duration {
+	return time.Duration(c.Codex.KeepaliveMinSecond) * time.Second
+}
+
+func (c *Config) KeepaliveMax() time.Duration {
+	return time.Duration(c.Codex.KeepaliveMaxSecond) * time.Second
 }
 
 func (c *Config) HTTPTimeout() time.Duration {
