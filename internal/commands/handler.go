@@ -111,7 +111,7 @@ func (h *Handler) status(targets []string) string {
 	if len(lines) == 0 {
 		return "没有匹配的目标。"
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n\n")
 }
 
 func (h *Handler) list() string {
@@ -196,7 +196,7 @@ func formatSnapshot(snapshot jobs.Snapshot, now time.Time) string {
 			value += "，下次约 " + relativeFuture(snapshot.NextAttempt, now)
 		}
 		if snapshot.LastError != "" {
-			value += "；最近失败：" + truncate(snapshot.LastError, 100)
+			value += "\n\n最近失败：" + truncate(snapshot.LastError, 100)
 		}
 		return prefix + value
 	case jobs.StateSucceeded:
