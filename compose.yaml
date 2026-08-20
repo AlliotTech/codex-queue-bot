@@ -10,6 +10,8 @@ services:
         required: false
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config.json:/app/config.json:ro
       - ./prompts.txt:/app/prompts.txt:ro

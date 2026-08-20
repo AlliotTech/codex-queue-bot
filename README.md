@@ -1,6 +1,6 @@
 # Codex Queue Bot
 
-这是一个由 OpenILink Hub 消息控制的 Codex API 排队与保活服务。收到 `/开挤` 后，它会使用原生 `codex exec` 随机发送轻量请求；失败后按随机间隔继续，直到请求成功，然后通过 OpenILink 回复“开蹬”并停止该目标。收到 `/保活` 后，它会立即请求一次，并在每次请求完成后按配置的随机间隔持续请求。
+这是一个带 Gin + React 控制台的 Codex API 排队与保活服务。浏览器控制台负责查看运行状态和启动/停止任务；OpenILink Hub 是可选的消息适配器，启用后继续支持原有中英文命令和成功通知。收到 `/开挤` 后，它会使用原生 `codex exec` 随机发送轻量请求；失败后按随机间隔继续，直到请求成功，然后通过 OpenILink 回复“开蹬”并停止该目标。收到 `/保活` 后，它会立即请求一次，并在每次请求完成后按配置的随机间隔持续请求。
 
 主要能力：
 
@@ -11,7 +11,31 @@
 - 每次从 `prompts.txt` 随机选择 Prompt，使用新的空临时目录和临时会话。
 - 当前目标的 API Key 仅通过最小化的子进程环境传给 Codex，不出现在命令参数或日志中；OpenILink Token、其他目标 Key 和无关环境变量不会被 Codex 继承。
 - OpenILink WebSocket 自动重连；成功通知发送失败时会持续退避重试，直到发送成功或进程退出。
-- 提供 Dockerfile 和 Compose 配置。
+- Web 控制台提供单管理员登录、CSRF 防护、SSE 实时状态、批量操作和最近 200 条内存活动记录；不提供在线配置、Prompt 或密钥编辑。
+- OpenILink 未配置或鉴权失败时，Web 仍可独立工作；所有任务入口共享同一个 Manager、队列优先级和并发上限。
+- 提供 Dockerfile 和 Compose 配置，前端构建产物嵌入 Go 二进制。
+
+## Web 控制台
+
+默认监听 `:8080`，打开 `http://127.0.0.1:8080/`。管理员密码只从 `web.admin_password_env` 指定的环境变量读取，默认变量名为 `WEB_ADMIN_PASSWORD`，且至少 12 个字符。生产默认使用 `Secure` Cookie；如果本机直接用 HTTP 调试，可在配置中显式设为 `false`。
+
+控制台展示服务版本、SSE 连接、OpenILink 连接状态、全局并发、每个目标的排队/保活阶段和倒计时，并支持单目标及批量开始/停止。所有时间由 API 以 RFC3339 返回，浏览器按本地时区显示。服务重启后会清空会话、任务状态和活动记录。
+
+API 路径如下：
+
+| 路径 | 作用 |
+|---|---|
+| `POST /api/v1/auth/login` | 创建 12 小时内存会话 |
+| `GET /api/v1/auth/session` | 获取当前会话和 CSRF Token |
+| `POST /api/v1/auth/logout` | 注销会话（需要 CSRF Header） |
+| `GET /api/v1/dashboard` | 获取综合快照和近期活动 |
+| `POST /api/v1/actions` | 执行 `queue.start/stop`、`keepalive.start/stop` |
+| `GET /api/v1/events` | SSE 初始快照、状态/活动事件和 15 秒心跳 |
+| `GET /healthz` | 无鉴权健康检查 |
+
+修改类请求必须带 `X-CSRF-Token`。操作请求格式为 `{"action":"queue.start","targets":["primary"]}`；`targets` 为空表示全部，未知目标会在 `unknown` 中返回且不影响其它目标（HTTP 仍为 200）。登录失败按客户端 IP 在 10 分钟内最多 5 次。Gin 默认不信任代理；只有 `web.trusted_proxies` 中显式声明的地址才会参与客户端 IP 判断。
+
+反向代理部署时请关闭 SSE 响应缓冲、传递 `X-Forwarded-For/Proto`，并将读取超时设为至少几分钟。例如 Nginx location 可设置 `proxy_buffering off`、`proxy_read_timeout 1h`。首版只支持站点根路径，不支持子路径或跨域前后端分离。
 
 ## 工作流程
 
@@ -36,6 +60,10 @@ OpenILink POST /bot/v1/message/send
 同一目标同时启用排队与保活时，排队任务拥有整轮优先权。已经执行中的保活请求可以完成，随后排队任务会连续重试直至成功或停止；这期间到期的保活会等待，并在排队结束后立即执行。`/停止` 只停止排队，`/停止保活` 只停止保活。
 
 ## OpenILink Hub 配置
+
+`openilink.enabled` 可以显式设为 `false`，此时服务不会连接 Hub，Web 控制台仍完整可用。为兼容旧配置，若省略该字段但配置了 `token` 或 `token_env`，适配器会自动启用；显式设为 `true` 时仍严格要求有效 Token。
+
+示例配置默认使用 Web-only（`enabled: false`）。需要启用 OpenILink 时，将它改为 `true`，并加入 `base_url`、`token_env`、`allowed_user_ids` 和 `http_timeout_seconds` 等原有字段。
 
 本项目对接的是你示例中使用的 Hub API：
 
@@ -108,13 +136,25 @@ cp .env.example .env
 
 `allowed_user_ids` 建议配置为你的 OpenILink 用户 ID。留空表示任何能向该 App 发消息的人都可以启动和停止任务。
 
+Web 配置：
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `listen_address` | `:8080` | Gin 监听地址 |
+| `admin_username` | `admin` | 单管理员用户名 |
+| `admin_password_env` | `WEB_ADMIN_PASSWORD` | 管理员密码环境变量名，不会通过 API 返回 |
+| `cookie_secure` | `true` | 会话 Cookie 的 Secure 属性 |
+| `trusted_proxies` | `[]` | 显式信任的代理 CIDR/IP，默认不信任代理 |
+| `activity_limit` | `200` | 内存活动记录上限 |
+
 ## 本机运行
 
 要求：
 
 - Go 1.24+
 - 当前最新版或兼容版本的原生 Codex CLI
-- 一个 OpenILink Hub App Token
+- `WEB_ADMIN_PASSWORD`（至少 12 个字符）
+- 可选：一个 OpenILink Hub App Token
 
 安装或确认 Codex：
 
@@ -125,12 +165,23 @@ codex --version
 
 这里采用 OpenAI 官方文档中的无版本号安装方式，因此 npm 会安装当前 `latest` 版本。
 
+如果修改了控制台源码，先生成嵌入式静态资源：
+
+```bash
+npm --prefix frontend ci
+npm --prefix frontend test
+npm --prefix frontend run build
+```
+
+构建输出会写入 `internal/web/ui/dist`，随后由 `go:embed` 打入 Go 二进制；Docker 和 CI 已自动执行这一步。
+
 导出密钥后先做静态检查：
 
 ```bash
 export OPENILINK_APP_TOKEN='...'
 export CODEX_KEY_PRIMARY='...'
 export CODEX_KEY_BACKUP='...'
+export WEB_ADMIN_PASSWORD='a-long-random-admin-password'
 
 go run ./cmd/codex-queue-bot -config ./config.json -check
 ```
@@ -176,6 +227,8 @@ docker compose pull
 docker compose up -d
 docker compose logs -f codex-queue-bot
 ```
+
+Compose 默认只把控制台映射到 `127.0.0.1:8080:8080`，适合由同机 HTTPS 反向代理对外提供。若确需直接暴露端口，应同时保留 `cookie_secure=true` 并使用 TLS。
 
 默认镜像是 `ghcr.io/alliottech/codex-queue-bot:latest`。可通过环境变量选择固定标签：
 

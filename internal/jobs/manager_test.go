@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -458,5 +459,136 @@ func TestQueueAndKeepaliveShareMaxParallel(t *testing.T) {
 	manager.StopKeepalive(nil)
 	if runner.maximumActive() != 1 {
 		t.Fatalf("shared semaphore allowed %d concurrent requests", runner.maximumActive())
+	}
+}
+
+func TestComprehensiveSnapshotIncludesSharedProcessCount(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Second, time.Second, time.Hour, time.Hour, 2, "开蹬")
+
+	manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
+	call := receiveControlledCall(t, runner)
+	snapshot := manager.ComprehensiveSnapshot()
+	if snapshot.CurrentProcesses != 1 || snapshot.MaxParallel != 2 {
+		t.Fatalf("concurrency snapshot = %+v", snapshot)
+	}
+	if len(snapshot.Targets) != 1 || snapshot.Targets[0].Queue.State != StateRunning || snapshot.Targets[0].Queue.Attempts != 1 {
+		t.Fatalf("target snapshot = %+v", snapshot.Targets)
+	}
+	call.result <- codex.Result{Success: true, Response: "ok"}
+	waitForCondition(t, func() bool { return manager.ComprehensiveSnapshot().CurrentProcesses == 0 })
+}
+
+func TestActivityLimitOrderingAndOperationMetadata(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := &blockingRunner{started: make(chan struct{})}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬", 3)
+
+	for i := 0; i < 3; i++ {
+		manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
+		manager.StopWithOperation(nil, Operation{Source: SourceWeb, Actor: "admin"})
+	}
+	activities := manager.Activities()
+	if len(activities) != 3 {
+		t.Fatalf("activity count = %d, want 3", len(activities))
+	}
+	for i, activity := range activities {
+		if activity.Source != SourceWeb || activity.Actor != "admin" {
+			t.Fatalf("activity metadata = %+v", activity)
+		}
+		if i > 0 && activities[i-1].ID <= activity.ID {
+			t.Fatalf("activities not newest first: %+v", activities)
+		}
+	}
+}
+
+func TestObserverEventsAreOrderedAndSlowObserverIsDisconnected(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := &blockingRunner{started: make(chan struct{})}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬")
+	_, _, subscription := manager.Observe(1)
+	defer subscription.Close()
+
+	manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
+	first, ok := <-subscription.Events
+	if !ok || first.Kind != EventActivity || first.Activity == nil || first.Activity.Type != "queue.start" {
+		t.Fatalf("first observer event = %+v, ok=%v", first, ok)
+	}
+	if _, ok := <-subscription.Events; ok {
+		t.Fatal("slow observer channel should be closed after its buffer fills")
+	}
+}
+
+func TestWebStartDoesNotNotifyButLaterOpenILinkSubscriptionDoes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	messenger := &channelMessenger{messages: make(chan sentMessage, 2)}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, messenger, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬")
+
+	manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
+	call := receiveControlledCall(t, runner)
+	result := manager.StartWithOperation(nil, Subscriber{Recipient: "user-1", TraceID: "trace-1"}, Operation{Source: SourceOpenILink, Actor: "user-1"})
+	if len(result.Already) != 1 {
+		t.Fatalf("subscription result = %+v", result)
+	}
+	call.result <- codex.Result{Success: true, Response: "ok"}
+	select {
+	case message := <-messenger.messages:
+		if message.to != "user-1" || message.traceID != "trace-1" {
+			t.Fatalf("notification = %+v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OpenILink subscriber did not receive notification")
+	}
+	select {
+	case extra := <-messenger.messages:
+		t.Fatalf("unexpected notification for Web start: %+v", extra)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestTargetErrorsAreSanitizedBeforeSnapshotsAndActivities(t *testing.T) {
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1/private", APIKey: "secret-key", APIKeyEnv: "SECRET_KEY_ENV", Model: "m", WireAPI: "responses"}
+	value := sanitizeTargetError(target, "request https://api.example/v1/private/responses with secret-key from SECRET_KEY_ENV failed")
+	for _, forbidden := range []string{target.APIBaseURL, target.APIKey, target.APIKeyEnv} {
+		if strings.Contains(value, forbidden) {
+			t.Fatalf("sanitized error leaked %q: %s", forbidden, value)
+		}
+	}
+	if !strings.Contains(value, "[URL]") || !strings.Contains(value, "[REDACTED]") {
+		t.Fatalf("sanitized error = %q", value)
+	}
+}
+
+func TestBeginShutdownCancelsRunsAndWaitsForCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬")
+	manager.Start(nil, Subscriber{})
+	call := receiveControlledCall(t, runner)
+	manager.BeginShutdown()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := manager.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	select {
+	case <-call.done:
+	default:
+		t.Fatal("runner was not cleaned up")
+	}
+	if result := manager.Start(nil, Subscriber{}); len(result.Started) != 0 {
+		t.Fatalf("start after shutdown = %+v", result)
 	}
 }

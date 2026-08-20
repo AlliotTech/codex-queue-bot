@@ -1,11 +1,20 @@
 {
   "openilink": {
+    "enabled": false,
     "base_url": "https://hub.example.com",
     "token_env": "OPENILINK_APP_TOKEN",
     "allowed_user_ids": [
       "wxid_your_user_id"
     ],
     "http_timeout_seconds": 15
+  },
+  "web": {
+    "listen_address": ":8080",
+    "admin_username": "admin",
+    "admin_password_env": "WEB_ADMIN_PASSWORD",
+    "cookie_secure": true,
+    "trusted_proxies": [],
+    "activity_limit": 200
   },
   "codex": {
     "binary": "codex",

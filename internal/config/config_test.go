@@ -59,6 +59,82 @@ func TestLoadAppliesDefaultsAndResolvesSecrets(t *testing.T) {
 	if cfg.KeepaliveMin() != 2700*time.Second || cfg.KeepaliveMax() != 3300*time.Second {
 		t.Fatalf("keepalive durations = %s-%s", cfg.KeepaliveMin(), cfg.KeepaliveMax())
 	}
+	if !cfg.OpenILinkEnabled() {
+		t.Fatal("legacy token_env configuration should enable OpenILink")
+	}
+	if cfg.Web.ListenAddress != ":8080" || cfg.Web.AdminUsername != "admin" || cfg.Web.AdminPasswordEnv != "WEB_ADMIN_PASSWORD" || cfg.Web.ActivityLimit != 200 || !cfg.Web.CookieSecure {
+		t.Fatalf("web defaults = %+v", cfg.Web)
+	}
+}
+
+func TestLoadAllowsWebOnlyConfigurationAndExplicitlyDisabledOpenILink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("TEST_CODEX_KEY", "codex-secret")
+	data := `{
+  "openilink": {"enabled": false, "token_env": "MISSING_TOKEN"},
+  "web": {"listen_address": "127.0.0.1:9090", "cookie_secure": false},
+  "codex": {"targets": [{"name":"main","api_base_url":"https://api.example/v1","api_key_env":"TEST_CODEX_KEY","model":"gpt-test"}]}
+}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenILinkEnabled() {
+		t.Fatal("OpenILink should be disabled")
+	}
+	if cfg.Web.CookieSecure || cfg.Web.ListenAddress != "127.0.0.1:9090" {
+		t.Fatalf("web configuration = %+v", cfg.Web)
+	}
+}
+
+func TestExplicitlyEnabledOpenILinkStillRequiresToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("TEST_CODEX_KEY", "codex-secret")
+	data := `{
+  "openilink": {"enabled": true, "base_url": "https://hub.example.com"},
+  "codex": {"targets": [{"name":"main","api_base_url":"https://api.example/v1","api_key_env":"TEST_CODEX_KEY","model":"gpt-test"}]}
+}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "openilink token is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestAdminPasswordComesOnlyFromEnvironmentAndHasMinimumLength(t *testing.T) {
+	cfg := Config{Web: WebConfig{AdminPasswordEnv: "TEST_WEB_PASSWORD"}}
+	t.Setenv("TEST_WEB_PASSWORD", "short")
+	if _, err := cfg.AdminPassword(); err == nil || !strings.Contains(err.Error(), "at least 12") {
+		t.Fatalf("short password error = %v", err)
+	}
+	t.Setenv("TEST_WEB_PASSWORD", "long-enough-password")
+	password, err := cfg.AdminPassword()
+	if err != nil || password != "long-enough-password" {
+		t.Fatalf("AdminPassword = %q, %v", password, err)
+	}
+}
+
+func TestLoadRejectsNegativeActivityLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("TEST_CODEX_KEY", "codex-secret")
+	data := `{
+  "openilink": {"enabled": false},
+  "web": {"activity_limit": -1},
+  "codex": {"targets": [{"name":"main","api_base_url":"https://api.example/v1","api_key_env":"TEST_CODEX_KEY","model":"gpt-test"}]}
+}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "activity_limit") {
+		t.Fatalf("error = %v", err)
+	}
 }
 
 func TestLoadKeepaliveInterval(t *testing.T) {

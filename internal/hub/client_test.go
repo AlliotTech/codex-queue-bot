@@ -3,8 +3,10 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,5 +121,46 @@ func TestRememberEventSurvivesReconnectBoundary(t *testing.T) {
 	}
 	if client.rememberEvent("evt-1") {
 		t.Fatal("duplicate event should be rejected")
+	}
+}
+
+func TestClientStatusBecomesUnauthorizedAndAdapterStops(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client := New(server.URL, "bad-token", time.Second, nil)
+	err := client.Run(context.Background(), func(context.Context, Incoming) {})
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("Run error = %v", err)
+	}
+	status := client.StatusStore().Snapshot()
+	if status.State != StatusUnauthorized || status.Error == "" {
+		t.Fatalf("status = %+v", status)
+	}
+}
+
+func TestStatusStoreSlowObserverIsDisconnected(t *testing.T) {
+	store := NewStatusStore(StatusDisabled)
+	_, observer := store.Observe(1)
+	defer observer.Close()
+	store.Set(StatusConnecting, "")
+	store.Set(StatusConnected, "")
+	first, ok := <-observer.Updates
+	if !ok || first.State != StatusConnecting {
+		t.Fatalf("first status = %+v, ok=%v", first, ok)
+	}
+	if _, ok := <-observer.Updates; ok {
+		t.Fatal("slow status observer should be closed")
+	}
+}
+
+func TestClientSafeErrorRedactsTokenAndURLs(t *testing.T) {
+	client := New("https://hub.example.com", "token/value", time.Second, nil)
+	value := client.safeError(errors.New("dial wss://hub.example.com/bot/v1/ws?token=token%2Fvalue failed for token/value"))
+	for _, forbidden := range []string{"token/value", "token%2Fvalue", "wss://hub.example.com"} {
+		if strings.Contains(value, forbidden) {
+			t.Fatalf("safe error leaked %q: %s", forbidden, value)
+		}
 	}
 }

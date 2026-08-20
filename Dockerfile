@@ -1,5 +1,17 @@
 # syntax=docker/dockerfile:1
 
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web-builder
+
+WORKDIR /src
+COPY frontend/package.json frontend/package-lock.json ./frontend/
+WORKDIR /src/frontend
+RUN --mount=type=cache,target=/root/.npm npm ci
+WORKDIR /src
+COPY frontend ./frontend
+RUN mkdir -p internal/web/ui/dist
+WORKDIR /src/frontend
+RUN npm run build
+
 FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
 ARG TARGETOS
@@ -11,6 +23,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
+COPY --from=web-builder /src/internal/web/ui/dist ./internal/web/ui/dist
 RUN CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
     go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
     -o /out/codex-queue-bot ./cmd/codex-queue-bot

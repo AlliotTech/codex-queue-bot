@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,20 +28,76 @@ const (
 	defaultReasoningEffort  = "low"
 	defaultWireAPI          = "responses"
 	defaultHTTPTimeout      = 15
+	defaultWebListenAddress = ":8080"
+	defaultWebAdminUsername = "admin"
+	defaultWebPasswordEnv   = "WEB_ADMIN_PASSWORD"
+	defaultWebActivityLimit = 200
 	minimumRetryIntervalSec = 1
 )
 
 type Config struct {
 	OpenILink OpenILinkConfig `json:"openilink"`
 	Codex     CodexConfig     `json:"codex"`
+	Web       WebConfig       `json:"web"`
 }
 
 type OpenILinkConfig struct {
+	// When enabled is omitted, a configured token (or token_env) enables the
+	// adapter for backwards compatibility. The private enabledSet bit records
+	// explicit false without making the public configuration field a pointer.
+	Enabled           bool     `json:"enabled,omitempty"`
 	BaseURL           string   `json:"base_url"`
 	Token             string   `json:"token,omitempty"`
 	TokenEnv          string   `json:"token_env,omitempty"`
 	AllowedUserIDs    []string `json:"allowed_user_ids,omitempty"`
 	HTTPTimeoutSecond int      `json:"http_timeout_seconds,omitempty"`
+	enabledSet        bool
+}
+
+// WebConfig contains only control-plane settings. Secrets are deliberately
+// resolved at runtime by the web package and are never exposed by API models.
+type WebConfig struct {
+	ListenAddress    string   `json:"listen_address,omitempty"`
+	AdminUsername    string   `json:"admin_username,omitempty"`
+	AdminPasswordEnv string   `json:"admin_password_env,omitempty"`
+	CookieSecure     bool     `json:"cookie_secure,omitempty"`
+	TrustedProxies   []string `json:"trusted_proxies,omitempty"`
+	ActivityLimit    int      `json:"activity_limit,omitempty"`
+	cookieSecureSet  bool
+}
+
+func (c *OpenILinkConfig) UnmarshalJSON(data []byte) error {
+	type plain OpenILinkConfig
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*c = OpenILinkConfig(decoded)
+	_, c.enabledSet = fields["enabled"]
+	return nil
+}
+
+func (c *WebConfig) UnmarshalJSON(data []byte) error {
+	type plain WebConfig
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*c = WebConfig(decoded)
+	_, c.cookieSecureSet = fields["cookie_secure"]
+	return nil
 }
 
 type CodexConfig struct {
@@ -99,6 +156,25 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults(configDir string) {
+	if c.Web.ListenAddress == "" {
+		c.Web.ListenAddress = defaultWebListenAddress
+	}
+	if strings.TrimSpace(c.Web.AdminUsername) == "" {
+		c.Web.AdminUsername = defaultWebAdminUsername
+	}
+	if strings.TrimSpace(c.Web.AdminPasswordEnv) == "" {
+		c.Web.AdminPasswordEnv = defaultWebPasswordEnv
+	}
+	if !c.Web.cookieSecureSet {
+		c.Web.CookieSecure = true
+	}
+	if c.Web.ActivityLimit == 0 {
+		c.Web.ActivityLimit = defaultWebActivityLimit
+	}
+	for i := range c.Web.TrustedProxies {
+		c.Web.TrustedProxies[i] = strings.TrimSpace(c.Web.TrustedProxies[i])
+	}
+
 	if strings.TrimSpace(c.OpenILink.BaseURL) == "" {
 		c.OpenILink.BaseURL = defaultHubBaseURL
 	}
@@ -157,7 +233,8 @@ func (c *Config) applyDefaults(configDir string) {
 }
 
 func (c *Config) resolveSecrets() error {
-	if c.OpenILink.Token == "" && c.OpenILink.TokenEnv != "" {
+	openILinkEnabled := c.OpenILink.IsOpenILinkEnabled()
+	if openILinkEnabled && c.OpenILink.Token == "" && c.OpenILink.TokenEnv != "" {
 		c.OpenILink.Token = os.Getenv(c.OpenILink.TokenEnv)
 		if c.OpenILink.Token == "" {
 			return fmt.Errorf("openilink.token_env %q is not set", c.OpenILink.TokenEnv)
@@ -176,14 +253,16 @@ func (c *Config) resolveSecrets() error {
 }
 
 func (c *Config) Validate() error {
-	if err := validateHTTPURL("openilink.base_url", c.OpenILink.BaseURL); err != nil {
-		return err
-	}
-	if strings.TrimSpace(c.OpenILink.Token) == "" {
-		return errors.New("openilink token is required (set token or token_env)")
-	}
-	if c.OpenILink.HTTPTimeoutSecond <= 0 {
-		return errors.New("openilink.http_timeout_seconds must be positive")
+	if c.OpenILink.IsOpenILinkEnabled() {
+		if err := validateHTTPURL("openilink.base_url", c.OpenILink.BaseURL); err != nil {
+			return err
+		}
+		if strings.TrimSpace(c.OpenILink.Token) == "" {
+			return errors.New("openilink token is required (set token or token_env)")
+		}
+		if c.OpenILink.HTTPTimeoutSecond <= 0 {
+			return errors.New("openilink.http_timeout_seconds must be positive")
+		}
 	}
 	if strings.TrimSpace(c.Codex.Binary) == "" {
 		return errors.New("codex.binary is required")
@@ -208,6 +287,9 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Codex.Targets) == 0 {
 		return errors.New("at least one codex target is required")
+	}
+	if c.Web.ActivityLimit < 0 {
+		return errors.New("web.activity_limit must not be negative")
 	}
 	if err := validateOverrides("codex.config_overrides", c.Codex.ConfigOverrides); err != nil {
 		return err
@@ -249,6 +331,31 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// IsOpenILinkEnabled implements the backwards-compatible default described in
+// the configuration contract.
+func (c OpenILinkConfig) IsOpenILinkEnabled() bool {
+	if c.enabledSet {
+		return c.Enabled
+	}
+	return c.Enabled || strings.TrimSpace(c.Token) != "" || strings.TrimSpace(c.TokenEnv) != ""
+}
+
+func (c *Config) OpenILinkEnabled() bool { return c.OpenILink.IsOpenILinkEnabled() }
+
+// AdminPassword reads the administrator password from the configured
+// environment variable. It intentionally does not retain or log the value.
+func (c *Config) AdminPassword() (string, error) {
+	envName := strings.TrimSpace(c.Web.AdminPasswordEnv)
+	if envName == "" {
+		return "", errors.New("web.admin_password_env is required")
+	}
+	password := os.Getenv(envName)
+	if len([]rune(password)) < 12 {
+		return "", fmt.Errorf("administrator password from %s must be at least 12 characters", envName)
+	}
+	return password, nil
 }
 
 func (c *Config) RequestTimeout() time.Duration {

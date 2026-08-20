@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +16,8 @@ import (
 )
 
 type State string
+
+var absoluteURLPattern = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s]+`)
 
 const (
 	StateIdle      State = "idle"
@@ -42,6 +46,19 @@ type Messenger interface {
 type Subscriber struct {
 	Recipient string
 	TraceID   string
+}
+
+type Source string
+
+const (
+	SourceWeb       Source = "web"
+	SourceOpenILink Source = "openilink"
+	SourceSystem    Source = "system"
+)
+
+type Operation struct {
+	Source Source
+	Actor  string
 }
 
 type StartResult struct {
@@ -96,6 +113,56 @@ type KeepaliveSnapshot struct {
 	LastError   string
 }
 
+type TargetSnapshot struct {
+	Name      string
+	Model     string
+	APIHost   string
+	Queue     Snapshot
+	Keepalive KeepaliveSnapshot
+}
+
+type ManagerSnapshot struct {
+	Targets          []TargetSnapshot
+	CurrentProcesses int
+	MaxParallel      int
+}
+
+type Activity struct {
+	ID       uint64
+	Type     string
+	Target   string
+	Source   Source
+	Actor    string
+	Attempts int
+	At       time.Time
+	Error    string
+}
+
+type EventKind string
+
+const (
+	EventState    EventKind = "state"
+	EventActivity EventKind = "activity"
+)
+
+type Event struct {
+	ID       uint64
+	Kind     EventKind
+	Snapshot *ManagerSnapshot
+	Activity *Activity
+}
+
+type Subscription struct {
+	Events <-chan Event
+	cancel func()
+}
+
+func (s *Subscription) Close() {
+	if s != nil && s.cancel != nil {
+		s.cancel()
+	}
+}
+
 type Manager struct {
 	root           context.Context
 	runner         AttemptRunner
@@ -107,13 +174,22 @@ type Manager struct {
 	keepaliveMax   time.Duration
 	successMessage string
 	sem            chan struct{}
+	maxParallel    int
+	activityLimit  int
 
-	mu         sync.Mutex
-	targets    map[string]config.Target
-	order      []string
-	jobs       map[string]*job
-	keepalives map[string]*keepaliveJob
-	arbiters   map[string]*targetArbiter
+	mu               sync.Mutex
+	targets          map[string]config.Target
+	order            []string
+	jobs             map[string]*job
+	keepalives       map[string]*keepaliveJob
+	arbiters         map[string]*targetArbiter
+	currentProcesses int
+	activities       []Activity
+	nextEventID      uint64
+	nextObserverID   uint64
+	observers        map[uint64]chan Event
+	runWG            sync.WaitGroup
+	shuttingDown     bool
 }
 
 type job struct {
@@ -127,6 +203,7 @@ type job struct {
 	runID       uint64
 	cancel      context.CancelFunc
 	subscribers map[string]Subscriber
+	operation   Operation
 }
 
 type keepaliveJob struct {
@@ -141,6 +218,7 @@ type keepaliveJob struct {
 	lastError   string
 	runID       uint64
 	cancel      context.CancelFunc
+	operation   Operation
 }
 
 type requestOwner uint8
@@ -167,9 +245,14 @@ func New(
 	keepaliveMin, keepaliveMax time.Duration,
 	maxParallel int,
 	successMessage string,
+	activityLimit ...int,
 ) *Manager {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	limit := 200
+	if len(activityLimit) > 0 && activityLimit[0] > 0 {
+		limit = activityLimit[0]
 	}
 	m := &Manager{
 		root:           root,
@@ -182,10 +265,14 @@ func New(
 		keepaliveMax:   keepaliveMax,
 		successMessage: successMessage,
 		sem:            make(chan struct{}, maxParallel),
+		maxParallel:    maxParallel,
+		activityLimit:  limit,
 		targets:        make(map[string]config.Target, len(targets)),
 		jobs:           make(map[string]*job, len(targets)),
 		keepalives:     make(map[string]*keepaliveJob, len(targets)),
 		arbiters:       make(map[string]*targetArbiter, len(targets)),
+		activities:     make([]Activity, 0, limit),
+		observers:      make(map[uint64]chan Event),
 	}
 	for _, target := range targets {
 		key := normalizeName(target.Name)
@@ -199,11 +286,23 @@ func New(
 }
 
 func (m *Manager) Start(names []string, subscriber Subscriber) StartResult {
+	return m.StartWithOperation(names, subscriber, Operation{Source: SourceSystem, Actor: "system"})
+}
+
+func (m *Manager) StartWithOperation(names []string, subscriber Subscriber, operation Operation) StartResult {
 	keys, unknown := m.resolve(names)
 	result := StartResult{Unknown: unknown}
+	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.shuttingDown {
+		for _, key := range keys {
+			result.Already = append(result.Already, m.targets[key].Name)
+		}
+		return result
+	}
+	changed := false
 	for _, key := range keys {
 		target := m.targets[key]
 		current := m.jobs[key]
@@ -226,19 +325,35 @@ func (m *Manager) Start(names []string, subscriber Subscriber) StartResult {
 		current.nextAttempt = time.Time{}
 		current.finishedAt = time.Time{}
 		current.lastError = ""
+		current.operation = operation
 		result.Started = append(result.Started, target.Name)
+		m.recordActivityLocked("queue.start", target.Name, operation, 0, "")
 		m.signalTargetLocked(key)
-		go m.run(jobCtx, key, runID)
+		changed = true
+		m.runWG.Add(1)
+		go func() {
+			defer m.runWG.Done()
+			m.run(jobCtx, key, runID)
+		}()
+	}
+	if changed {
+		m.broadcastStateLocked()
 	}
 
 	return result
 }
 
 func (m *Manager) Stop(names []string) StopResult {
+	return m.StopWithOperation(names, Operation{Source: SourceSystem, Actor: "system"})
+}
+
+func (m *Manager) StopWithOperation(names []string, operation Operation) StopResult {
 	keys, unknown := m.resolve(names)
 	result := StopResult{Unknown: unknown}
+	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
+	changed := false
 	for _, key := range keys {
 		target := m.targets[key]
 		current := m.jobs[key]
@@ -254,21 +369,38 @@ func (m *Manager) Stop(names []string) StopResult {
 		current.nextAttempt = time.Time{}
 		current.subscribers = make(map[string]Subscriber)
 		result.Stopped = append(result.Stopped, target.Name)
+		m.recordActivityLocked("queue.stop", target.Name, operation, current.attempts, "")
 		m.signalTargetLocked(key)
+		changed = true
 		if cancel != nil {
 			cancel()
 		}
+	}
+	if changed {
+		m.broadcastStateLocked()
 	}
 	m.mu.Unlock()
 	return result
 }
 
 func (m *Manager) StartKeepalive(names []string) KeepaliveStartResult {
+	return m.StartKeepaliveWithOperation(names, Operation{Source: SourceSystem, Actor: "system"})
+}
+
+func (m *Manager) StartKeepaliveWithOperation(names []string, operation Operation) KeepaliveStartResult {
 	keys, unknown := m.resolve(names)
 	result := KeepaliveStartResult{Unknown: unknown}
+	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.shuttingDown {
+		for _, key := range keys {
+			result.Already = append(result.Already, m.targets[key].Name)
+		}
+		return result
+	}
+	changed := false
 	for _, key := range keys {
 		target := m.targets[key]
 		current := m.keepalives[key]
@@ -290,19 +422,35 @@ func (m *Manager) StartKeepalive(names []string) KeepaliveStartResult {
 		current.nextRequest = time.Time{}
 		current.stoppedAt = time.Time{}
 		current.lastError = ""
+		current.operation = operation
 		result.Started = append(result.Started, target.Name)
+		m.recordActivityLocked("keepalive.start", target.Name, operation, 0, "")
 		m.signalTargetLocked(key)
-		go m.runKeepalive(keepaliveCtx, key, runID)
+		changed = true
+		m.runWG.Add(1)
+		go func() {
+			defer m.runWG.Done()
+			m.runKeepalive(keepaliveCtx, key, runID)
+		}()
+	}
+	if changed {
+		m.broadcastStateLocked()
 	}
 
 	return result
 }
 
 func (m *Manager) StopKeepalive(names []string) KeepaliveStopResult {
+	return m.StopKeepaliveWithOperation(names, Operation{Source: SourceSystem, Actor: "system"})
+}
+
+func (m *Manager) StopKeepaliveWithOperation(names []string, operation Operation) KeepaliveStopResult {
 	keys, unknown := m.resolve(names)
 	result := KeepaliveStopResult{Unknown: unknown}
+	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
+	changed := false
 	for _, key := range keys {
 		target := m.targets[key]
 		current := m.keepalives[key]
@@ -317,10 +465,15 @@ func (m *Manager) StopKeepalive(names []string) KeepaliveStopResult {
 		current.stoppedAt = time.Now()
 		current.nextRequest = time.Time{}
 		result.Stopped = append(result.Stopped, target.Name)
+		m.recordActivityLocked("keepalive.stop", target.Name, operation, current.requests, "")
 		m.signalTargetLocked(key)
+		changed = true
 		if cancel != nil {
 			cancel()
 		}
+	}
+	if changed {
+		m.broadcastStateLocked()
 	}
 	m.mu.Unlock()
 	return result
@@ -333,20 +486,7 @@ func (m *Manager) Snapshots(names []string) ([]Snapshot, []string) {
 
 	result := make([]Snapshot, 0, len(keys))
 	for _, key := range keys {
-		target := m.targets[key]
-		current := m.jobs[key]
-		result = append(result, Snapshot{
-			Name:        target.Name,
-			Model:       target.Model,
-			APIHost:     codex.TargetHost(target),
-			State:       current.state,
-			Attempts:    current.attempts,
-			StartedAt:   current.startedAt,
-			LastAttempt: current.lastAttempt,
-			NextAttempt: current.nextAttempt,
-			FinishedAt:  current.finishedAt,
-			LastError:   current.lastError,
-		})
+		result = append(result, m.queueSnapshotLocked(key))
 	}
 	return result, unknown
 }
@@ -358,24 +498,98 @@ func (m *Manager) KeepaliveSnapshots(names []string) ([]KeepaliveSnapshot, []str
 
 	result := make([]KeepaliveSnapshot, 0, len(keys))
 	for _, key := range keys {
-		target := m.targets[key]
-		current := m.keepalives[key]
-		result = append(result, KeepaliveSnapshot{
-			Name:        target.Name,
-			Model:       target.Model,
-			APIHost:     codex.TargetHost(target),
-			State:       current.state,
-			Requests:    current.requests,
-			StartedAt:   current.startedAt,
-			LastRequest: current.lastRequest,
-			LastSuccess: current.lastSuccess,
-			LastFailure: current.lastFailure,
-			NextRequest: current.nextRequest,
-			StoppedAt:   current.stoppedAt,
-			LastError:   current.lastError,
-		})
+		result = append(result, m.keepaliveSnapshotLocked(key))
 	}
 	return result, unknown
+}
+
+// ComprehensiveSnapshot returns all target and process state while holding a
+// single lock, so the Web and OpenILink views cannot observe mixed moments.
+func (m *Manager) ComprehensiveSnapshot() ManagerSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.snapshotLocked()
+}
+
+func (m *Manager) DashboardSnapshot() (ManagerSnapshot, []Activity) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.snapshotLocked(), m.activitiesLocked()
+}
+
+// Activities returns newest-first copies of the in-memory activity log.
+func (m *Manager) Activities() []Activity {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activitiesLocked()
+}
+
+// Observe atomically registers an observer and returns the initial state and
+// activity log. Producers never block: an observer whose buffer fills is
+// removed and its channel is closed, allowing an SSE client to reconnect.
+func (m *Manager) Observe(buffer int) (ManagerSnapshot, []Activity, *Subscription) {
+	if buffer <= 0 {
+		buffer = 32
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextObserverID++
+	id := m.nextObserverID
+	channel := make(chan Event, buffer)
+	m.observers[id] = channel
+	subscription := &Subscription{
+		Events: channel,
+		cancel: func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if current, ok := m.observers[id]; ok {
+				delete(m.observers, id)
+				close(current)
+			}
+		},
+	}
+	return m.snapshotLocked(), m.activitiesLocked(), subscription
+}
+
+func (m *Manager) ObserverCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.observers)
+}
+
+// BeginShutdown prevents new jobs and cancels every active run. Call Wait
+// after request ingress has stopped to wait for Codex subprocess cleanup.
+func (m *Manager) BeginShutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shuttingDown {
+		return
+	}
+	m.shuttingDown = true
+	for _, current := range m.jobs {
+		if current.cancel != nil {
+			current.cancel()
+		}
+	}
+	for _, current := range m.keepalives {
+		if current.cancel != nil {
+			current.cancel()
+		}
+	}
+}
+
+func (m *Manager) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		m.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) TargetNames() []string {
@@ -386,6 +600,112 @@ func (m *Manager) TargetNames() []string {
 		names = append(names, m.targets[key].Name)
 	}
 	return names
+}
+
+func (m *Manager) queueSnapshotLocked(key string) Snapshot {
+	target := m.targets[key]
+	current := m.jobs[key]
+	return Snapshot{
+		Name:        target.Name,
+		Model:       target.Model,
+		APIHost:     codex.TargetHost(target),
+		State:       current.state,
+		Attempts:    current.attempts,
+		StartedAt:   current.startedAt,
+		LastAttempt: current.lastAttempt,
+		NextAttempt: current.nextAttempt,
+		FinishedAt:  current.finishedAt,
+		LastError:   current.lastError,
+	}
+}
+
+func (m *Manager) keepaliveSnapshotLocked(key string) KeepaliveSnapshot {
+	target := m.targets[key]
+	current := m.keepalives[key]
+	return KeepaliveSnapshot{
+		Name:        target.Name,
+		Model:       target.Model,
+		APIHost:     codex.TargetHost(target),
+		State:       current.state,
+		Requests:    current.requests,
+		StartedAt:   current.startedAt,
+		LastRequest: current.lastRequest,
+		LastSuccess: current.lastSuccess,
+		LastFailure: current.lastFailure,
+		NextRequest: current.nextRequest,
+		StoppedAt:   current.stoppedAt,
+		LastError:   current.lastError,
+	}
+}
+
+func (m *Manager) snapshotLocked() ManagerSnapshot {
+	snapshot := ManagerSnapshot{
+		Targets:          make([]TargetSnapshot, 0, len(m.order)),
+		CurrentProcesses: m.currentProcesses,
+		MaxParallel:      m.maxParallel,
+	}
+	for _, key := range m.order {
+		queue := m.queueSnapshotLocked(key)
+		keepalive := m.keepaliveSnapshotLocked(key)
+		snapshot.Targets = append(snapshot.Targets, TargetSnapshot{
+			Name:      queue.Name,
+			Model:     queue.Model,
+			APIHost:   queue.APIHost,
+			Queue:     queue,
+			Keepalive: keepalive,
+		})
+	}
+	return snapshot
+}
+
+func (m *Manager) activitiesLocked() []Activity {
+	result := make([]Activity, len(m.activities))
+	for i := range m.activities {
+		result[len(m.activities)-1-i] = m.activities[i]
+	}
+	return result
+}
+
+func (m *Manager) recordActivityLocked(activityType, target string, operation Operation, attempts int, errorText string) {
+	operation = normalizeOperation(operation)
+	if targetConfig, ok := m.targets[normalizeName(target)]; ok {
+		errorText = sanitizeTargetError(targetConfig, errorText)
+	}
+	m.nextEventID++
+	activity := Activity{
+		ID:       m.nextEventID,
+		Type:     activityType,
+		Target:   target,
+		Source:   operation.Source,
+		Actor:    operation.Actor,
+		Attempts: attempts,
+		At:       time.Now(),
+		Error:    truncate(errorText, 600),
+	}
+	m.activities = append(m.activities, activity)
+	if len(m.activities) > m.activityLimit {
+		copy(m.activities, m.activities[len(m.activities)-m.activityLimit:])
+		m.activities = m.activities[:m.activityLimit]
+	}
+	activityCopy := activity
+	m.publishLocked(Event{ID: activity.ID, Kind: EventActivity, Activity: &activityCopy})
+}
+
+func (m *Manager) broadcastStateLocked() {
+	m.nextEventID++
+	snapshot := m.snapshotLocked()
+	m.publishLocked(Event{ID: m.nextEventID, Kind: EventState, Snapshot: &snapshot})
+}
+
+func (m *Manager) publishLocked(event Event) {
+	for id, observer := range m.observers {
+		select {
+		case observer <- event:
+		default:
+			delete(m.observers, id)
+			close(observer)
+		}
+	}
 }
 
 func (m *Manager) run(ctx context.Context, key string, runID uint64) {
@@ -401,13 +721,13 @@ func (m *Manager) run(ctx context.Context, key string, runID uint64) {
 
 		attempt, target, ok := m.beginAttempt(key, runID)
 		if !ok {
-			m.release()
+			m.releaseSlot()
 			m.releaseTarget(key, requestOwnerQueue, runID)
 			return
 		}
 		m.logger.Info("starting Codex queue attempt", "target", target.Name, "attempt", attempt, "api_host", codex.TargetHost(target))
 		result := m.runner.Run(ctx, target, attempt)
-		m.release()
+		m.finishProcess()
 
 		if result.Success {
 			subscribers, elapsed, ok := m.markSuccess(key, runID)
@@ -427,7 +747,7 @@ func (m *Manager) run(ctx context.Context, key string, runID uint64) {
 		if !m.markFailure(key, runID, result, delay) {
 			return
 		}
-		m.logger.Warn("Codex queue attempt failed", "target", target.Name, "attempt", attempt, "error", result.Error, "retry_in", delay)
+		m.logger.Warn("Codex queue attempt failed", "target", target.Name, "attempt", attempt, "error", sanitizeTargetError(target, result.Error), "retry_in", delay)
 		if !wait(ctx, delay) {
 			m.markQueueCancelled(key, runID)
 			return
@@ -444,7 +764,7 @@ func (m *Manager) runKeepalive(ctx context.Context, key string, runID uint64) {
 		}
 		m.logger.Info("starting Codex keepalive request", "target", target.Name, "request", request, "api_host", codex.TargetHost(target))
 		result := m.runner.Run(ctx, target, request)
-		m.release()
+		m.finishProcess()
 
 		if ctx.Err() != nil {
 			m.markKeepaliveCancelled(key, runID)
@@ -457,7 +777,7 @@ func (m *Manager) runKeepalive(ctx context.Context, key string, runID uint64) {
 		if result.Success {
 			m.logger.Info("Codex keepalive request succeeded", "target", target.Name, "request", request, "next_in", delay)
 		} else {
-			m.logger.Warn("Codex keepalive request failed", "target", target.Name, "request", request, "error", result.Error, "next_in", delay)
+			m.logger.Warn("Codex keepalive request failed", "target", target.Name, "request", request, "error", sanitizeTargetError(target, result.Error), "next_in", delay)
 		}
 		if !wait(ctx, delay) {
 			m.markKeepaliveCancelled(key, runID)
@@ -500,10 +820,14 @@ func (m *Manager) beginKeepaliveRequest(ctx context.Context, key string, runID u
 			return 0, config.Target{}, false
 		}
 		if queue.state == StateRunning || arbiter.owner != requestOwnerNone {
+			previousState := current.state
 			if queue.state == StateRunning || arbiter.owner == requestOwnerQueue {
 				current.state = KeepaliveStateWaitingQueue
 			} else {
 				current.state = KeepaliveStateRequesting
+			}
+			if current.state != previousState {
+				m.broadcastStateLocked()
 			}
 			changed := arbiter.changed
 			m.mu.Unlock()
@@ -512,7 +836,10 @@ func (m *Manager) beginKeepaliveRequest(ctx context.Context, key string, runID u
 			}
 			continue
 		}
-		current.state = KeepaliveStateRequesting
+		if current.state != KeepaliveStateRequesting {
+			current.state = KeepaliveStateRequesting
+			m.broadcastStateLocked()
+		}
 		m.mu.Unlock()
 
 		if !m.acquire(ctx) {
@@ -525,16 +852,20 @@ func (m *Manager) beginKeepaliveRequest(ctx context.Context, key string, runID u
 		arbiter = m.arbiters[key]
 		if current.runID != runID || current.state == KeepaliveStateStopped {
 			m.mu.Unlock()
-			m.release()
+			m.releaseSlot()
 			return 0, config.Target{}, false
 		}
 		if queue.state == StateRunning || arbiter.owner != requestOwnerNone {
+			previousState := current.state
 			if queue.state == StateRunning || arbiter.owner == requestOwnerQueue {
 				current.state = KeepaliveStateWaitingQueue
 			}
+			if current.state != previousState {
+				m.broadcastStateLocked()
+			}
 			changed := arbiter.changed
 			m.mu.Unlock()
-			m.release()
+			m.releaseSlot()
 			if !waitForChange(ctx, changed) {
 				return 0, config.Target{}, false
 			}
@@ -547,8 +878,10 @@ func (m *Manager) beginKeepaliveRequest(ctx context.Context, key string, runID u
 		current.requests++
 		current.lastRequest = time.Now()
 		current.nextRequest = time.Time{}
+		m.currentProcesses++
 		request := current.requests
 		target := m.targets[key]
+		m.broadcastStateLocked()
 		m.mu.Unlock()
 		return request, target, true
 	}
@@ -565,6 +898,8 @@ func (m *Manager) beginAttempt(key string, runID uint64) (int, config.Target, bo
 	current.attempts++
 	current.lastAttempt = time.Now()
 	current.nextAttempt = time.Time{}
+	m.currentProcesses++
+	m.broadcastStateLocked()
 	return current.attempts, m.targets[key], true
 }
 
@@ -574,10 +909,15 @@ func (m *Manager) markFailure(key string, runID uint64, result codex.Result, del
 	current := m.jobs[key]
 	valid := current.runID == runID && current.state == StateRunning
 	if valid {
-		current.lastError = truncate(result.Error, 600)
+		target := m.targets[key]
+		current.lastError = sanitizeTargetError(target, result.Error)
 		current.nextAttempt = time.Now().Add(delay)
+		m.recordActivityLocked("queue.request.failure", target.Name, current.operation, current.attempts, current.lastError)
 	}
 	m.releaseTargetLocked(key, requestOwnerQueue, runID)
+	if valid {
+		m.broadcastStateLocked()
+	}
 	return valid
 }
 
@@ -602,7 +942,10 @@ func (m *Manager) markSuccess(key string, runID uint64) ([]Subscriber, time.Dura
 		subscribers = append(subscribers, subscriber)
 	}
 	current.subscribers = make(map[string]Subscriber)
+	target := m.targets[key]
+	m.recordActivityLocked("queue.request.success", target.Name, current.operation, current.attempts, "")
 	m.releaseTargetLocked(key, requestOwnerQueue, runID)
+	m.broadcastStateLocked()
 	return subscribers, current.finishedAt.Sub(current.startedAt), true
 }
 
@@ -619,11 +962,20 @@ func (m *Manager) finishKeepaliveRequest(key string, runID uint64, result codex.
 		current.lastSuccess = now
 	} else {
 		current.lastFailure = now
-		current.lastError = truncate(result.Error, 600)
+		current.lastError = sanitizeTargetError(m.targets[key], result.Error)
 	}
 	current.state = KeepaliveStateWaitingNext
 	current.nextRequest = now.Add(delay)
+	target := m.targets[key]
+	activityType := "keepalive.request.failure"
+	activityError := current.lastError
+	if result.Success {
+		activityType = "keepalive.request.success"
+		activityError = ""
+	}
+	m.recordActivityLocked(activityType, target.Name, current.operation, current.requests, activityError)
 	m.releaseTargetLocked(key, requestOwnerKeepalive, runID)
+	m.broadcastStateLocked()
 	return true
 }
 
@@ -640,7 +992,10 @@ func (m *Manager) markQueueCancelled(key string, runID uint64) {
 	current.nextAttempt = time.Time{}
 	current.cancel = nil
 	current.subscribers = make(map[string]Subscriber)
+	target := m.targets[key]
+	m.recordActivityLocked("queue.stop", target.Name, Operation{Source: SourceSystem, Actor: "shutdown"}, current.attempts, "")
 	m.signalTargetLocked(key)
+	m.broadcastStateLocked()
 }
 
 func (m *Manager) markKeepaliveCancelled(key string, runID uint64) {
@@ -655,7 +1010,10 @@ func (m *Manager) markKeepaliveCancelled(key string, runID uint64) {
 	current.stoppedAt = time.Now()
 	current.nextRequest = time.Time{}
 	current.cancel = nil
+	target := m.targets[key]
+	m.recordActivityLocked("keepalive.stop", target.Name, Operation{Source: SourceSystem, Actor: "shutdown"}, current.requests, "")
 	m.signalTargetLocked(key)
+	m.broadcastStateLocked()
 }
 
 func (m *Manager) releaseTarget(key string, owner requestOwner, runID uint64) {
@@ -681,6 +1039,9 @@ func (m *Manager) signalTargetLocked(key string) {
 }
 
 func (m *Manager) notifySuccess(target string, attempt int, elapsed time.Duration, subscribers []Subscriber) {
+	if m.messenger == nil {
+		return
+	}
 	message := fmt.Sprintf("✅ %s：%s（第 %d 次，耗时 %s）", target, m.successMessage, attempt, formatDuration(elapsed))
 	for _, subscriber := range subscribers {
 		subscriber := subscriber
@@ -738,12 +1099,35 @@ func (m *Manager) acquire(ctx context.Context) bool {
 	}
 }
 
-func (m *Manager) release() {
+func (m *Manager) finishProcess() {
+	m.mu.Lock()
+	if m.currentProcesses > 0 {
+		m.currentProcesses--
+	}
+	m.broadcastStateLocked()
+	m.mu.Unlock()
+	<-m.sem
+}
+
+func (m *Manager) releaseSlot() {
 	<-m.sem
 }
 
 func normalizeName(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeOperation(operation Operation) Operation {
+	switch operation.Source {
+	case SourceWeb, SourceOpenILink, SourceSystem:
+	default:
+		operation.Source = SourceSystem
+	}
+	operation.Actor = strings.TrimSpace(operation.Actor)
+	if operation.Actor == "" {
+		operation.Actor = string(operation.Source)
+	}
+	return operation
 }
 
 func containsAll(names []string) bool {
@@ -790,6 +1174,17 @@ func truncate(value string, maximum int) string {
 		return value
 	}
 	return string(runes[:maximum]) + "…"
+}
+
+func sanitizeTargetError(target config.Target, value string) string {
+	value = strings.TrimSpace(value)
+	value = absoluteURLPattern.ReplaceAllString(value, "[URL]")
+	for _, secret := range []string{target.APIKey, url.QueryEscape(target.APIKey), target.APIKeyEnv} {
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		}
+	}
+	return truncate(value, 600)
 }
 
 func formatDuration(duration time.Duration) string {

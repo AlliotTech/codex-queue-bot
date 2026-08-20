@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"codex-queue-bot/internal/codex"
 	"codex-queue-bot/internal/commands"
@@ -16,6 +20,7 @@ import (
 	"codex-queue-bot/internal/hub"
 	"codex-queue-bot/internal/jobs"
 	"codex-queue-bot/internal/proxyenv"
+	"codex-queue-bot/internal/web"
 )
 
 var version = "dev"
@@ -52,6 +57,11 @@ func main() {
 		logger.Error("configuration error", "error", err)
 		os.Exit(2)
 	}
+	adminPassword, err := cfg.AdminPassword()
+	if err != nil {
+		logger.Error("web administrator configuration error", "error", err)
+		os.Exit(2)
+	}
 
 	runner := &codex.Runner{
 		Binary:          cfg.Codex.Binary,
@@ -72,12 +82,20 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	hubClient := hub.New(cfg.OpenILink.BaseURL, cfg.OpenILink.Token, cfg.HTTPTimeout(), logger)
+
+	statusStore := hub.NewStatusStore(hub.StatusDisabled)
+	var hubClient *hub.Client
+	var messenger jobs.Messenger
+	if cfg.OpenILinkEnabled() {
+		hubClient = hub.New(cfg.OpenILink.BaseURL, cfg.OpenILink.Token, cfg.HTTPTimeout(), logger)
+		statusStore = hubClient.StatusStore()
+		messenger = hubClient
+	}
 	manager := jobs.New(
 		ctx,
 		cfg.Codex.Targets,
 		runner,
-		hubClient,
+		messenger,
 		logger,
 		cfg.RetryMin(),
 		cfg.RetryMax(),
@@ -85,23 +103,95 @@ func main() {
 		cfg.KeepaliveMax(),
 		cfg.Codex.MaxParallel,
 		cfg.Codex.SuccessMessage,
+		cfg.Web.ActivityLimit,
 	)
-	handler := commands.New(manager, hubClient, logger, cfg.OpenILink.AllowedUserIDs)
+
+	webServer, err := web.New(web.Options{
+		Manager:         manager,
+		OpenILinkStatus: statusStore,
+		Username:        cfg.Web.AdminUsername,
+		Password:        adminPassword,
+		CookieSecure:    cfg.Web.CookieSecure,
+		TrustedProxies:  cfg.Web.TrustedProxies,
+		Version:         version,
+		Logger:          logger,
+		Shutdown:        ctx.Done(),
+	})
+	if err != nil {
+		logger.Error("web server configuration error", "error", err)
+		os.Exit(2)
+	}
+	listener, err := net.Listen("tcp", cfg.Web.ListenAddress)
+	if err != nil {
+		logger.Error("Gin listen failed", "address", cfg.Web.ListenAddress, "error", err)
+		os.Exit(1)
+	}
+	httpServer := &http.Server{
+		Handler:           webServer.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	serveErrors := make(chan error, 1)
+	go func() {
+		serveErrors <- httpServer.Serve(listener)
+	}()
+
+	if hubClient != nil {
+		handler := commands.New(manager, hubClient, logger, cfg.OpenILink.AllowedUserIDs)
+		go func() {
+			if err := hubClient.Run(ctx, handler.Handle); err != nil {
+				if errors.Is(err, hub.ErrUnauthorized) {
+					logger.Error("OpenILink authentication failed; Web console remains available", "error", err)
+				} else if ctx.Err() == nil {
+					logger.Error("OpenILink listener stopped; Web console remains available", "error", err)
+				}
+			}
+		}()
+	}
 
 	logger.Info(
-		"Codex queue bot started",
+		"Codex Web console started",
 		"version", version,
-		"openilink", cfg.OpenILink.BaseURL,
+		"listen_address", cfg.Web.ListenAddress,
+		"openilink_enabled", cfg.OpenILinkEnabled(),
 		"targets", strings.Join(manager.TargetNames(), ","),
 		"max_parallel", cfg.Codex.MaxParallel,
 		"keepalive_min", cfg.KeepaliveMin(),
 		"keepalive_max", cfg.KeepaliveMax(),
 	)
-	if err := hubClient.Run(ctx, handler.Handle); err != nil {
-		logger.Error("OpenILink listener stopped", "error", err)
-		os.Exit(1)
+
+	exitCode := 0
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown signal received")
+	case err := <-serveErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("Gin server stopped", "error", err)
+			exitCode = 1
+		}
+		stop()
+	}
+	manager.BeginShutdown()
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("web server graceful shutdown failed", "error", err)
+		_ = httpServer.Close()
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	}
+	if err := manager.Wait(shutdownCtx); err != nil {
+		logger.Error("Codex process shutdown timed out", "error", err)
+		if exitCode == 0 {
+			exitCode = 1
+		}
 	}
 	logger.Info("Codex queue bot stopped")
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }
 
 func newLogger(rawLevel string) *slog.Logger {

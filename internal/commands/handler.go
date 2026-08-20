@@ -49,13 +49,13 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 	case "开挤", "start", "go":
 		response = h.start(targets, incoming)
 	case "停止", "停挤", "stop":
-		response = h.stop(targets)
+		response = h.stopFrom(targets, incoming)
 	case "状态", "status":
 		response = h.status(targets)
 	case "保活", "keepalive":
-		response = h.startKeepalive(targets)
+		response = h.startKeepaliveFrom(targets, incoming)
 	case "停止保活", "stop-keepalive":
-		response = h.stopKeepalive(targets)
+		response = h.stopKeepaliveFrom(targets, incoming)
 	case "保活状态", "keepalive-status":
 		response = h.keepaliveStatus(targets)
 	case "列表", "目标", "list", "targets":
@@ -69,7 +69,11 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 }
 
 func (h *Handler) start(targets []string, incoming hub.Incoming) string {
-	result := h.manager.Start(targets, jobs.Subscriber{Recipient: incoming.SenderID, TraceID: incoming.TraceID})
+	result := h.manager.StartWithOperation(
+		targets,
+		jobs.Subscriber{Recipient: incoming.SenderID, TraceID: incoming.TraceID},
+		jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID},
+	)
 	parts := make([]string, 0, 3)
 	if len(result.Started) > 0 {
 		parts = append(parts, "已开始："+strings.Join(result.Started, "、"))
@@ -86,8 +90,16 @@ func (h *Handler) start(targets []string, incoming hub.Incoming) string {
 	return strings.Join(parts, "\n")
 }
 
+func (h *Handler) stopFrom(targets []string, incoming hub.Incoming) string {
+	result := h.manager.StopWithOperation(targets, jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID})
+	return formatStopResult(result)
+}
+
 func (h *Handler) stop(targets []string) string {
-	result := h.manager.Stop(targets)
+	return formatStopResult(h.manager.Stop(targets))
+}
+
+func formatStopResult(result jobs.StopResult) string {
 	parts := make([]string, 0, 3)
 	if len(result.Stopped) > 0 {
 		parts = append(parts, "已停止："+strings.Join(result.Stopped, "、"))
@@ -104,8 +116,16 @@ func (h *Handler) stop(targets []string) string {
 	return strings.Join(parts, "\n")
 }
 
+func (h *Handler) startKeepaliveFrom(targets []string, incoming hub.Incoming) string {
+	result := h.manager.StartKeepaliveWithOperation(targets, jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID})
+	return formatKeepaliveStartResult(result)
+}
+
 func (h *Handler) startKeepalive(targets []string) string {
-	result := h.manager.StartKeepalive(targets)
+	return formatKeepaliveStartResult(h.manager.StartKeepalive(targets))
+}
+
+func formatKeepaliveStartResult(result jobs.KeepaliveStartResult) string {
 	parts := make([]string, 0, 3)
 	if len(result.Started) > 0 {
 		parts = append(parts, "已开始保活："+strings.Join(result.Started, "、"))
@@ -122,8 +142,16 @@ func (h *Handler) startKeepalive(targets []string) string {
 	return strings.Join(parts, "\n")
 }
 
+func (h *Handler) stopKeepaliveFrom(targets []string, incoming hub.Incoming) string {
+	result := h.manager.StopKeepaliveWithOperation(targets, jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID})
+	return formatKeepaliveStopResult(result)
+}
+
 func (h *Handler) stopKeepalive(targets []string) string {
-	result := h.manager.StopKeepalive(targets)
+	return formatKeepaliveStopResult(h.manager.StopKeepalive(targets))
+}
+
+func formatKeepaliveStopResult(result jobs.KeepaliveStopResult) string {
 	parts := make([]string, 0, 3)
 	if len(result.Stopped) > 0 {
 		parts = append(parts, "已停止保活："+strings.Join(result.Stopped, "、"))

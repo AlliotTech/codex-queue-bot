@@ -7,6 +7,9 @@ openilink-tools.json
 *.log
 *.pid
 .codex
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo
 secrets
 credentials
 *.pem

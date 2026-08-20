@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,12 +26,101 @@ const (
 )
 
 var ErrUnauthorized = errors.New("OpenILink Hub rejected the app token")
+var absoluteURLPattern = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s]+`)
 
 type Incoming struct {
 	EventID  string
 	TraceID  string
 	SenderID string
 	Text     string
+}
+
+type Status string
+
+const (
+	StatusDisabled     Status = "disabled"
+	StatusConnecting   Status = "connecting"
+	StatusConnected    Status = "connected"
+	StatusReconnecting Status = "reconnecting"
+	StatusUnauthorized Status = "unauthorized"
+)
+
+type StatusSnapshot struct {
+	State     Status
+	Error     string
+	UpdatedAt time.Time
+}
+
+type StatusSubscription struct {
+	Updates <-chan StatusSnapshot
+	cancel  func()
+}
+
+func (s *StatusSubscription) Close() {
+	if s != nil && s.cancel != nil {
+		s.cancel()
+	}
+}
+
+type StatusStore struct {
+	mu             sync.Mutex
+	snapshot       StatusSnapshot
+	nextObserverID uint64
+	observers      map[uint64]chan StatusSnapshot
+}
+
+func NewStatusStore(initial Status) *StatusStore {
+	return &StatusStore{
+		snapshot:  StatusSnapshot{State: initial, UpdatedAt: time.Now()},
+		observers: make(map[uint64]chan StatusSnapshot),
+	}
+}
+
+func (s *StatusStore) Snapshot() StatusSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshot
+}
+
+func (s *StatusStore) Observe(buffer int) (StatusSnapshot, *StatusSubscription) {
+	if buffer <= 0 {
+		buffer = 8
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextObserverID++
+	id := s.nextObserverID
+	updates := make(chan StatusSnapshot, buffer)
+	s.observers[id] = updates
+	return s.snapshot, &StatusSubscription{
+		Updates: updates,
+		cancel: func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if current, ok := s.observers[id]; ok {
+				delete(s.observers, id)
+				close(current)
+			}
+		},
+	}
+}
+
+func (s *StatusStore) Set(state Status, errorText string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	errorText = strings.TrimSpace(errorText)
+	if len([]rune(errorText)) > 600 {
+		errorText = string([]rune(errorText)[:600]) + "…"
+	}
+	s.snapshot = StatusSnapshot{State: state, Error: errorText, UpdatedAt: time.Now()}
+	for id, observer := range s.observers {
+		select {
+		case observer <- s.snapshot:
+		default:
+			delete(s.observers, id)
+			close(observer)
+		}
+	}
 }
 
 type Client struct {
@@ -42,6 +132,9 @@ type Client struct {
 	seenMu     sync.Mutex
 	seen       map[string]struct{}
 	seenOrder  []string
+	status     *StatusStore
+	runMu      sync.Mutex
+	runCancel  context.CancelFunc
 }
 
 type wsEnvelope struct {
@@ -83,10 +176,25 @@ func New(baseURL, token string, timeout time.Duration, logger *slog.Logger) *Cli
 		logger:    logger,
 		seen:      make(map[string]struct{}, maxRememberedEvent),
 		seenOrder: make([]string, 0, maxRememberedEvent),
+		status:    NewStatusStore(StatusConnecting),
 	}
 }
 
+func (c *Client) StatusStore() *StatusStore { return c.status }
+
 func (c *Client) Run(ctx context.Context, handler func(context.Context, Incoming)) error {
+	adapterCtx, cancel := context.WithCancel(ctx)
+	c.runMu.Lock()
+	c.runCancel = cancel
+	c.runMu.Unlock()
+	defer func() {
+		cancel()
+		c.runMu.Lock()
+		c.runCancel = nil
+		c.runMu.Unlock()
+	}()
+	ctx = adapterCtx
+	c.status.Set(StatusConnecting, "")
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
@@ -96,9 +204,12 @@ func (c *Client) Run(ctx context.Context, handler func(context.Context, Incoming
 		conn, err := c.connect(ctx)
 		if err != nil {
 			if errors.Is(err, ErrUnauthorized) {
+				c.status.Set(StatusUnauthorized, err.Error())
 				return err
 			}
-			c.logger.Warn("OpenILink WebSocket connection failed", "error", err, "retry_in", backoff)
+			safeError := c.safeError(err)
+			c.status.Set(StatusReconnecting, safeError)
+			c.logger.Warn("OpenILink WebSocket connection failed", "error", safeError, "retry_in", backoff)
 			if !waitContext(ctx, withJitter(backoff)) {
 				return nil
 			}
@@ -107,13 +218,19 @@ func (c *Client) Run(ctx context.Context, handler func(context.Context, Incoming
 		}
 
 		backoff = time.Second
+		c.status.Set(StatusConnected, "")
 		c.logger.Info("OpenILink WebSocket connected", "base_url", c.baseURL)
 		err = c.readLoop(ctx, conn, handler)
 		_ = conn.Close()
+		if c.status.Snapshot().State == StatusUnauthorized {
+			return ErrUnauthorized
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
-		c.logger.Warn("OpenILink WebSocket disconnected", "error", err, "retry_in", backoff)
+		safeError := c.safeError(err)
+		c.status.Set(StatusReconnecting, safeError)
+		c.logger.Warn("OpenILink WebSocket disconnected", "error", safeError, "retry_in", backoff)
 		if !waitContext(ctx, withJitter(backoff)) {
 			return nil
 		}
@@ -150,27 +267,38 @@ func (c *Client) Send(ctx context.Context, to, content, traceID string) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send OpenILink message: %w", err)
+		return fmt.Errorf("send OpenILink message: %s", c.safeError(err))
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		c.status.Set(StatusUnauthorized, ErrUnauthorized.Error())
+		c.stopAdapter()
 		return ErrUnauthorized
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("send OpenILink message: HTTP %d: %s", resp.StatusCode, compactBody(respBody))
+		return fmt.Errorf("send OpenILink message: HTTP %d: %s", resp.StatusCode, c.safeText(compactBody(respBody)))
 	}
 
 	var result map[string]any
 	if len(respBody) > 0 && json.Unmarshal(respBody, &result) == nil {
 		if ok, exists := result["ok"].(bool); exists && !ok {
-			return fmt.Errorf("send OpenILink message: %v", result["error"])
+			return fmt.Errorf("send OpenILink message: %s", c.safeText(fmt.Sprint(result["error"])))
 		}
 		if ok, exists := result["success"].(bool); exists && !ok {
-			return fmt.Errorf("send OpenILink message failed: %s", compactBody(respBody))
+			return fmt.Errorf("send OpenILink message failed: %s", c.safeText(compactBody(respBody)))
 		}
 	}
 	return nil
+}
+
+func (c *Client) stopAdapter() {
+	c.runMu.Lock()
+	cancel := c.runCancel
+	c.runMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (c *Client) connect(ctx context.Context) (*websocket.Conn, error) {
@@ -336,6 +464,23 @@ func compactBody(body []byte) string {
 	runes := []rune(value)
 	if len(runes) > 512 {
 		return string(runes[:512])
+	}
+	return value
+}
+
+func (c *Client) safeError(err error) string {
+	if err == nil {
+		return "connection closed"
+	}
+	return c.safeText(err.Error())
+}
+
+func (c *Client) safeText(value string) string {
+	value = absoluteURLPattern.ReplaceAllString(value, "[URL]")
+	for _, secret := range []string{c.token, url.QueryEscape(c.token)} {
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		}
 	}
 	return value
 }
