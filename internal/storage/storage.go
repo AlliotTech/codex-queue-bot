@@ -540,8 +540,8 @@ func (s *Store) SetupAdmin(ctx context.Context, username, password string) (Snap
 	if username == "" {
 		return Snapshot{}, errors.New("administrator username is required")
 	}
-	if len([]rune(password)) < 12 {
-		return Snapshot{}, errors.New("administrator password must be at least 12 characters")
+	if len([]rune(password)) < config.MinimumAdminPasswordLength {
+		return Snapshot{}, fmt.Errorf("administrator password must be at least %d characters", config.MinimumAdminPasswordLength)
 	}
 	hash, err := hashPassword(password)
 	if err != nil {
@@ -609,8 +609,8 @@ func (s *Store) UpdateAccount(ctx context.Context, username, newPassword string)
 	var newHash string
 	var err error
 	if newPassword != "" {
-		if len([]rune(newPassword)) < 12 {
-			return Snapshot{}, errors.New("administrator password must be at least 12 characters")
+		if len([]rune(newPassword)) < config.MinimumAdminPasswordLength {
+			return Snapshot{}, fmt.Errorf("administrator password must be at least %d characters", config.MinimumAdminPasswordLength)
 		}
 		newHash, err = hashPassword(newPassword)
 		if err != nil {

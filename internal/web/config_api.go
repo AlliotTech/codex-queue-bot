@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
@@ -148,8 +149,8 @@ func (s *Server) setup(c *gin.Context) {
 		return
 	}
 	request.Username = strings.TrimSpace(request.Username)
-	if request.Username == "" || len([]rune(request.Password)) < 12 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名不能为空，密码至少需要 12 个字符"})
+	if request.Username == "" || len([]rune(request.Password)) < config.MinimumAdminPasswordLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("用户名不能为空，密码至少需要 %d 个字符", config.MinimumAdminPasswordLength)})
 		return
 	}
 	s.configWriteMu.Lock()
@@ -317,8 +318,8 @@ func (s *Server) updateAccount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password 与 new_password 不一致"})
 		return
 	}
-	if newPassword != "" && len([]rune(newPassword)) < 12 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "管理员密码至少需要 12 个字符"})
+	if newPassword != "" && len([]rune(newPassword)) < config.MinimumAdminPasswordLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("管理员密码至少需要 %d 个字符", config.MinimumAdminPasswordLength)})
 		return
 	}
 	if request.CurrentPassword != "" {

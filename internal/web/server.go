@@ -128,8 +128,8 @@ func New(options Options) (*Server, error) {
 		if options.Username == "" {
 			return nil, errors.New("web administrator username is required")
 		}
-		if len([]rune(options.Password)) < 12 {
-			return nil, errors.New("web administrator password must be at least 12 characters")
+		if len([]rune(options.Password)) < appconfig.MinimumAdminPasswordLength {
+			return nil, fmt.Errorf("web administrator password must be at least %d characters", appconfig.MinimumAdminPasswordLength)
 		}
 	} else if options.InitialConfig.Revision == 0 {
 		loaded, err := options.ConfigStore.Load(context.Background())

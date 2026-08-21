@@ -37,6 +37,10 @@ const (
 	minimumRetryIntervalSec = 1
 )
 
+// MinimumAdminPasswordLength is the minimum number of characters accepted for
+// an administrator password.
+const MinimumAdminPasswordLength = 5
+
 type Config struct {
 	OpenILink OpenILinkConfig `json:"openilink"`
 	Codex     CodexConfig     `json:"codex"`
@@ -496,8 +500,8 @@ func (c *Config) AdminPassword() (string, error) {
 		return "", errors.New("web.admin_password_env is required")
 	}
 	password := os.Getenv(envName)
-	if len([]rune(password)) < 12 {
-		return "", fmt.Errorf("administrator password from %s must be at least 12 characters", envName)
+	if len([]rune(password)) < MinimumAdminPasswordLength {
+		return "", fmt.Errorf("administrator password from %s must be at least %d characters", envName, MinimumAdminPasswordLength)
 	}
 	return password, nil
 }

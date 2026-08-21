@@ -108,9 +108,9 @@ func newDatabaseWebFixture(t *testing.T, runner *testRunner) databaseWebFixture 
 	return databaseWebFixture{webFixture: webFixture{server: server, manager: manager, cancel: cancel}, store: store}
 }
 
-func setupDatabaseFixture(t *testing.T, server *Server, username string) (string, string) {
+func setupDatabaseFixture(t *testing.T, server *Server, username, password string) (string, string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"username":%q,"password":"correct-horse-battery"}`, username)
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
 	recorder := performRequest(server, http.MethodPost, "/api/v1/setup", body, "", "", "192.0.2.20:1")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("setup status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -361,7 +361,7 @@ func TestDatabaseSetupCreatesSessionAndRejectsLaterSetup(t *testing.T) {
 	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"required":true`) || !strings.Contains(status.Body.String(), `"suggested_username":"admin"`) {
 		t.Fatalf("setup status = %d %s", status.Code, status.Body.String())
 	}
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner")
+	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "abcde")
 	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/config", "", cookie, "", "192.0.2.20:1"); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"username":"owner"`) {
 		t.Fatalf("config after setup = %d %s", response.Code, response.Body.String())
 	}
@@ -421,7 +421,7 @@ func TestDatabaseSetupRaceOnlyCreatesOneAdministrator(t *testing.T) {
 func TestConfigurationTargetLifecycleRestartStatusAndAccountRevocation(t *testing.T) {
 	runner := &testRunner{block: true, start: make(chan struct{})}
 	fixture := newDatabaseWebFixture(t, runner)
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner")
+	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
 
 	createBody := `{"name":"main","api_base_url":"https://api.example.test/v1/private","api_key":"target-secret-value","model":"gpt-test","wire_api":"responses","config_overrides":[]}`
 	created := performRequest(fixture.server, http.MethodPost, "/api/v1/targets", createBody, cookie, csrf, "192.0.2.20:1")
@@ -481,7 +481,7 @@ func TestConfigurationTargetLifecycleRestartStatusAndAccountRevocation(t *testin
 	if invalidWeb.Code != http.StatusBadRequest {
 		t.Fatalf("invalid web config = %d %s", invalidWeb.Code, invalidWeb.Body.String())
 	}
-	invalidAccount := performRequest(fixture.server, http.MethodPut, "/api/v1/account", `{"username":"owner","new_password":"too-short"}`, cookie, csrf, "192.0.2.20:1")
+	invalidAccount := performRequest(fixture.server, http.MethodPut, "/api/v1/account", `{"username":"owner","new_password":"1234"}`, cookie, csrf, "192.0.2.20:1")
 	if invalidAccount.Code != http.StatusBadRequest {
 		t.Fatalf("invalid account password = %d %s", invalidAccount.Code, invalidAccount.Body.String())
 	}
@@ -505,7 +505,7 @@ func TestConfigurationTargetLifecycleRestartStatusAndAccountRevocation(t *testin
 
 func TestOpenILinkTokenMaskKeepAndClearRules(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner")
+	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
 	base := `{"enabled":false,"base_url":"https://hub.example","allowed_user_ids":[],"http_timeout_seconds":15,`
 
 	setToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", base+`"token":"openilink-secret","clear_token":false}`, cookie, csrf, "192.0.2.20:1")
@@ -532,7 +532,7 @@ func TestOpenILinkTokenMaskKeepAndClearRules(t *testing.T) {
 
 func TestRestartRequiredClearsForNewServerStartup(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner")
+	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
 	codexBody := `{"binary":"codex-next","prompts_file":"prompts.txt","request_timeout_seconds":180,"retry_min_seconds":3,"retry_max_seconds":8,"keepalive_min_seconds":2700,"keepalive_max_seconds":3300,"max_parallel":2,"success_message":"ok","reasoning_effort":"low","config_overrides":[]}`
 	updated := performRequest(fixture.server, http.MethodPut, "/api/v1/config/codex", codexBody, cookie, csrf, "192.0.2.20:1")
 	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"restart_required":true`) {

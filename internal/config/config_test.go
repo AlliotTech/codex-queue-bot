@@ -109,13 +109,13 @@ func TestExplicitlyEnabledOpenILinkStillRequiresToken(t *testing.T) {
 
 func TestAdminPasswordComesOnlyFromEnvironmentAndHasMinimumLength(t *testing.T) {
 	cfg := Config{Web: WebConfig{AdminPasswordEnv: "TEST_WEB_PASSWORD"}}
-	t.Setenv("TEST_WEB_PASSWORD", "short")
-	if _, err := cfg.AdminPassword(); err == nil || !strings.Contains(err.Error(), "at least 12") {
+	t.Setenv("TEST_WEB_PASSWORD", "four")
+	if _, err := cfg.AdminPassword(); err == nil || !strings.Contains(err.Error(), "at least 5") {
 		t.Fatalf("short password error = %v", err)
 	}
-	t.Setenv("TEST_WEB_PASSWORD", "long-enough-password")
+	t.Setenv("TEST_WEB_PASSWORD", "abcde")
 	password, err := cfg.AdminPassword()
-	if err != nil || password != "long-enough-password" {
+	if err != nil || password != "abcde" {
 		t.Fatalf("AdminPassword = %q, %v", password, err)
 	}
 }
