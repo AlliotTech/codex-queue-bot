@@ -1,341 +1,106 @@
 # Codex Queue Bot
 
-这是一个带 Gin + React 控制台的 Codex API 排队与保活服务。浏览器控制台负责查看运行状态和启动/停止任务；OpenILink Hub 是可选的消息适配器，启用后继续支持原有中英文命令和成功通知。收到 `/开挤` 后，它会使用原生 `codex exec` 随机发送轻量请求；失败后按随机间隔继续，直到请求成功，然后通过 OpenILink 回复“开蹬”并停止该目标。收到 `/保活` 后，它会立即请求一次，并在每次请求完成后按配置的随机间隔持续请求。
+Codex API 排队与保活服务，提供 Gin + React 管理控制台。多个 target 共用同一个任务队列、并发上限和运行状态；OpenILink 是可选的消息入口。
 
-主要能力：
+## 快速部署
 
-- 一个进程配置多个 Codex Key / API 地址 / 模型，每个配置称为一个“目标”。
-- 排队命令 `/开挤`、`/状态`、`/停止`，保活命令 `/保活`、`/保活状态`、`/停止保活`，以及 `/列表`、`/帮助`。
-- 多目标可并行运行，并通过 `max_parallel` 控制本机同时存在的 Codex 进程数。
-- 排队和保活复用同一套 Prompt、Codex Runner、密钥隔离与全局并发限制；同一目标不会同时发起两类请求。
-- 每次从 `prompts.txt` 随机选择 Prompt，使用新的空临时目录和临时会话。
-- 当前目标的 API Key 仅通过最小化的子进程环境传给 Codex，不出现在命令参数或日志中；OpenILink Token、其他目标 Key 和无关环境变量不会被 Codex 继承。
-- OpenILink WebSocket 自动重连；成功通知发送失败时会持续退避重试，直到发送成功或进程退出。
-- Web 控制台提供单管理员登录、CSRF 防护、SSE 实时状态、批量操作和最近 200 条内存活动记录；不提供在线配置、Prompt 或密钥编辑。
-- OpenILink 未配置或鉴权失败时，Web 仍可独立工作；所有任务入口共享同一个 Manager、队列优先级和并发上限。
-- 提供 Dockerfile 和 Compose 配置，前端构建产物嵌入 Go 二进制。
-
-## Web 控制台
-
-默认监听 `:8080`，打开 `http://127.0.0.1:8080/`。管理员密码只从 `web.admin_password_env` 指定的环境变量读取，默认变量名为 `WEB_ADMIN_PASSWORD`，且至少 12 个字符。生产默认使用 `Secure` Cookie；如果本机直接用 HTTP 调试，可在配置中显式设为 `false`。
-
-控制台展示服务版本、SSE 连接、OpenILink 连接状态、全局并发、每个目标的排队/保活阶段和倒计时，并支持单目标及批量开始/停止。所有时间由 API 以 RFC3339 返回，浏览器按本地时区显示。服务重启后会清空会话、任务状态和活动记录。
-
-API 路径如下：
-
-| 路径 | 作用 |
-|---|---|
-| `POST /api/v1/auth/login` | 创建 12 小时内存会话 |
-| `GET /api/v1/auth/session` | 获取当前会话和 CSRF Token |
-| `POST /api/v1/auth/logout` | 注销会话（需要 CSRF Header） |
-| `GET /api/v1/dashboard` | 获取综合快照和近期活动 |
-| `POST /api/v1/actions` | 执行 `queue.start/stop`、`keepalive.start/stop` |
-| `GET /api/v1/events` | SSE 初始快照、状态/活动事件和 15 秒心跳 |
-| `GET /healthz` | 无鉴权健康检查 |
-
-修改类请求必须带 `X-CSRF-Token`。操作请求格式为 `{"action":"queue.start","targets":["primary"]}`；`targets` 为空表示全部，未知目标会在 `unknown` 中返回且不影响其它目标（HTTP 仍为 200）。登录失败按客户端 IP 在 10 分钟内最多 5 次。Gin 默认不信任代理；只有 `web.trusted_proxies` 中显式声明的地址才会参与客户端 IP 判断。
-
-反向代理部署时请关闭 SSE 响应缓冲、传递 `X-Forwarded-For/Proto`，并将读取超时设为至少几分钟。例如 Nginx location 可设置 `proxy_buffering off`、`proxy_read_timeout 1h`。首版只支持站点根路径，不支持子路径或跨域前后端分离。
-
-## 工作流程
-
-```text
-微信 /开挤
-    ↓
-OpenILink Hub WebSocket
-    ↓
-Go 服务启动一个或多个目标
-    ↓
-原生 codex exec → 失败 → 随机等待 → 再试
-                  ↓成功
-OpenILink POST /bot/v1/message/send
-    ↓
-微信收到：✅ primary：开蹬（第 N 次，耗时 ...）
-```
-
-每个目标成功后停止。以后若再次掉出队列，重新发送 `/开挤` 即可开始新一轮。
-
-保活默认关闭，需要通过 `/保活` 显式启动。每个目标拥有独立计时器：启动后立即请求，无论成功还是失败，都会在请求结束后重新生成下一次随机间隔。保活失败只写日志和状态，不发送聊天通知，也不会自动停止。
-
-同一目标同时启用排队与保活时，排队任务拥有整轮优先权。已经执行中的保活请求可以完成，随后排队任务会连续重试直至成功或停止；这期间到期的保活会等待，并在排队结束后立即执行。`/停止` 只停止排队，`/停止保活` 只停止保活。
-
-## OpenILink Hub 配置
-
-`openilink.enabled` 可以显式设为 `false`，此时服务不会连接 Hub，Web 控制台仍完整可用。为兼容旧配置，若省略该字段但配置了 `token` 或 `token_env`，适配器会自动启用；显式设为 `true` 时仍严格要求有效 Token。
-
-示例配置默认使用 Web-only（`enabled: false`）。需要启用 OpenILink 时，将它改为 `true`，并加入 `base_url`、`token_env`、`allowed_user_ids` 和 `http_timeout_seconds` 等原有字段。
-
-本项目对接的是你示例中使用的 Hub API：
-
-```text
-POST /bot/v1/message/send
-GET  /bot/v1/ws?token={app_token}
-```
-
-在 OpenILink Hub 中创建或安装一个 WebSocket App，并确保安装拥有：
-
-- Events：`message`
-- Scopes：`message:read`、`message:write`
-- App Token：用于 WebSocket 和 Bot API
-
-建议将 [openilink-tools.example.json](openilink-tools.example.json) 中的 Tools 配到 App，这样 `/开挤` 等命令会被确定性路由到本服务。即使收到的是 `message.text` 而不是 `command` 事件，服务也能识别同样的文本命令。
-
-你提供的 `openilink-sdk-go` 是微信原始 iLink Bot API SDK，而 `/bot/v1/...` 是 OpenILink Hub 的 App API，两者是不同协议层。因此当前实现直接使用 Hub 的 WebSocket + REST API，能够复用现有 Hub URL 和 Bearer App Token，不需要再直连微信 iLink。
-
-相关文档：
-
-- [OpenILink API](https://openilink.com/docs/api)
-- [OpenILink Hub WebSocket](https://openilink.com/docs/hub/websocket)
-- [OpenILink Hub App 开发](https://github.com/openilink/openilink-hub/blob/main/docs/app-development.md)
-
-## 配置多个 Key / API
-
-复制配置模板：
+要求 Docker Compose v2。
 
 ```bash
-cp config.example.json config.json
 cp .env.example .env
+openssl rand -base64 32
+# 将上一步输出填入 .env 的 CODEX_QUEUE_MASTER_KEY
+docker compose up -d
+docker compose logs -f codex-queue-bot
 ```
 
-一个目标对应一组 API 地址、Key 和模型：
+打开 <http://127.0.0.1:8080/>。第一次访问时创建唯一管理员，密码至少 12 个字符；初始化前请确保页面只对可信网络开放。
 
-```json
-{
-  "name": "primary",
-  "api_base_url": "https://codex-a.example.com/v1",
-  "api_key_env": "CODEX_KEY_PRIMARY",
-  "model": "gpt-5.2-codex",
-  "wire_api": "responses"
-}
-```
+Compose 默认使用 GHCR 镜像，并持久化 SQLite 数据库：
 
-字段说明：
+- 数据库：命名卷 `codex-queue-data` → `/app/data/codex-queue-bot.db`
+- Prompt：只读挂载 `./prompts.txt` → `/app/prompts.txt`
+- 端口：`127.0.0.1:8080:8080`（仅本机访问）
 
-| 字段 | 说明 |
-|---|---|
-| `name` | 命令中使用的目标名，不能含空格或逗号 |
-| `api_base_url` | Codex 兼容 Responses API 的基地址，程序不会自动追加 `/v1` |
-| `api_key_env` | 保存 Key 的环境变量名，推荐方式 |
-| `api_key` | 也可直接写 Key，但不建议将密钥放进配置文件 |
-| `model` | 该站点支持的模型名 |
-| `wire_api` | 当前固定为 `responses` |
-| `config_overrides` | 可选，追加给 Codex 的 `-c key=value` 配置 |
+如果需要让局域网直接访问，将 `compose.yaml` 中的映射改为 `8080:8080`，但生产环境建议保持本机绑定并通过 HTTPS 反向代理暴露。代理需要关闭 SSE 缓冲（例如 `proxy_buffering off`），并把读取超时设为至少一小时。
 
-全局 Codex 配置：
-
-| 字段 | 默认值 | 说明 |
-|---|---:|---|
-| `request_timeout_seconds` | `180` | 单次 Codex 请求超时 |
-| `retry_min_seconds` | `3` | 失败后最短等待时间，最低 1 秒 |
-| `retry_max_seconds` | `8` | 失败后最长等待时间 |
-| `keepalive_min_seconds` | `2700` | 保活请求完成后的最短等待时间，最低 1 秒 |
-| `keepalive_max_seconds` | `3300` | 保活请求完成后的最长等待时间，不得小于最短时间 |
-| `max_parallel` | `2` | 同时运行的 Codex 子进程上限 |
-| `reasoning_effort` | `low` | 健康请求使用的推理强度 |
-| `success_message` | `开蹬` | 成功通知正文 |
-
-`allowed_user_ids` 建议配置为你的 OpenILink 用户 ID。留空表示任何能向该 App 发消息的人都可以启动和停止任务。
-
-Web 配置：
-
-| 字段 | 默认值 | 说明 |
-|---|---:|---|
-| `listen_address` | `:8080` | Gin 监听地址 |
-| `admin_username` | `admin` | 单管理员用户名 |
-| `admin_password_env` | `WEB_ADMIN_PASSWORD` | 管理员密码环境变量名，不会通过 API 返回 |
-| `cookie_secure` | `true` | 会话 Cookie 的 Secure 属性 |
-| `trusted_proxies` | `[]` | 显式信任的代理 CIDR/IP，默认不信任代理 |
-| `activity_limit` | `200` | 内存活动记录上限 |
-
-## 本机运行
-
-要求：
-
-- Go 1.24+
-- 当前最新版或兼容版本的原生 Codex CLI
-- `WEB_ADMIN_PASSWORD`（至少 12 个字符）
-- 可选：一个 OpenILink Hub App Token
-
-安装或确认 Codex：
+查看 Compose 最终配置：
 
 ```bash
-npm install -g @openai/codex
-codex --version
+docker compose config
 ```
 
-这里采用 OpenAI 官方文档中的无版本号安装方式，因此 npm 会安装当前 `latest` 版本。
+## 配置与数据
 
-如果修改了控制台源码，先生成嵌入式静态资源：
+SQLite 是运行时的唯一配置源。登录控制台后可以维护 target、Codex 参数、OpenILink 和 Web 设置；密钥写入数据库前会加密，API 不会返回原文。
+
+必须设置：
+
+- `CODEX_QUEUE_MASTER_KEY`：Base64 编码的 32 字节随机值。首次生成后必须长期保存；丢失或更换会导致数据库密钥无法解密。
+
+可选环境变量见 [.env.example](.env.example)：镜像名、日志级别和出站代理。Codex API Key、OpenILink Token 通常在控制台配置，不需要写入 `.env`。
+
+常用启动参数：
+
+```text
+-db <path>       SQLite 路径（默认 data/codex-queue-bot.db）
+-config <path>   仅用于首次导入旧 JSON（默认 config.json）
+-check           执行配置、Codex 和 Prompt 预检后退出
+-version         输出版本
+```
+
+旧版 JSON 仅支持一次性迁移。需要迁移时，复制并修改 [config.example.json](config.example.json)，按 `compose.yaml` 中的注释临时挂载 `config.json`，启动成功后移除挂载。迁移会把 API Key 和 Token 加密写入 SQLite，之后不再读取 JSON。
+
+请同时备份 `codex-queue-data` 卷和 `CODEX_QUEUE_MASTER_KEY`。会话、任务状态和活动记录保存在内存中，服务重启后会清空。
+
+## 控制台与任务
+
+控制台展示 SSE 连接、OpenILink 状态、并发概览、每个 target 的排队/保活状态和近期活动，并支持单个或批量启动、停止任务。配置页会标记需要重启才能生效的字段。
+
+任务规则：
+
+- 排队失败后按配置的随机区间重试，成功后停止该 target。
+- 保活启动后立即请求，之后在随机区间内继续请求；失败只记录状态。
+- 同一 target 不会同时执行排队和保活；排队优先。
+
+## OpenILink（可选）
+
+OpenILink 默认关闭。可在控制台配置并启用；连接失败或鉴权失败不会影响 Web 控制台。原有中英文命令继续可用：
+
+| 中文 | 英文别名 | 作用 |
+|---|---|---|
+| `/开挤` | `/start` | 开始排队 |
+| `/状态` | `/status` | 查看排队状态 |
+| `/停止` | `/stop` | 停止排队 |
+| `/保活` | `/keepalive` | 开启保活 |
+| `/保活状态` | `/keepalive-status` | 查看保活状态 |
+| `/停止保活` | `/stop-keepalive` | 停止保活 |
+| `/列表` | `/list` | 查看 target 列表 |
+| `/帮助` | `/help` | 查看帮助 |
+
+多个 target 可用空格、逗号或分号分隔；`all`/`全部` 表示全部目标。
+
+## 本机开发
+
+要求 Go 1.24+、Node 22+ 和可用的 Codex CLI：
 
 ```bash
 npm --prefix frontend ci
 npm --prefix frontend test
 npm --prefix frontend run build
+
+export CODEX_QUEUE_MASTER_KEY="$(openssl rand -base64 32)"
+go run ./cmd/codex-queue-bot -check
+go run ./cmd/codex-queue-bot
 ```
 
-构建输出会写入 `internal/web/ui/dist`，随后由 `go:embed` 打入 Go 二进制；Docker 和 CI 已自动执行这一步。
-
-导出密钥后先做静态检查：
+前端构建产物会嵌入 Go 二进制；Docker 构建会自动执行前端构建。提交前建议运行：
 
 ```bash
-export OPENILINK_APP_TOKEN='...'
-export CODEX_KEY_PRIMARY='...'
-export CODEX_KEY_BACKUP='...'
-export WEB_ADMIN_PASSWORD='a-long-random-admin-password'
-
-go run ./cmd/codex-queue-bot -config ./config.json -check
-```
-
-启动：
-
-```bash
-go run ./cmd/codex-queue-bot -config ./config.json
-```
-
-日志级别可通过 `LOG_LEVEL=debug|info|warn|error` 设置。日志会显示目标名、API Host、次数和错误摘要，不会记录 Key。
-
-## 微信命令
-
-| 命令 | 作用 |
-|---|---|
-| `/开挤` | 启动全部目标 |
-| `/开挤 primary` | 只启动 `primary` |
-| `/开挤 primary,backup` | 同时启动多个目标 |
-| `/状态` | 查看全部目标状态 |
-| `/状态 primary` | 查看一个目标 |
-| `/停止` | 停止全部正在运行的目标 |
-| `/停止 primary` | 停止一个目标 |
-| `/保活` | 启动全部目标的保活；每个目标立即请求一次 |
-| `/保活 primary,backup` | 启动指定目标的保活 |
-| `/保活状态 [目标]` | 查看保活阶段、总请求次数、下次请求和最近失败 |
-| `/停止保活 [目标]` | 停止保活，并取消该目标正在执行的保活请求 |
-| `/列表` | 查看目标、模型和 API Host，不显示 Key |
-| `/帮助` | 显示命令帮助 |
-
-如果目标已经运行，另一位获授权用户再次发送 `/开挤 <目标>` 不会启动重复进程，而是订阅该轮成功通知。
-
-重复发送 `/保活 <目标>` 只会报告该目标“正在保活”，不会重置请求次数或计时。
-
-同时支持英文别名：`/start`、`/status`、`/stop`、`/keepalive`、`/keepalive-status`、`/stop-keepalive`、`/list`、`/help`。
-
-## Docker 部署
-
-编辑 `.env` 和 `config.json` 后，Compose 会直接拉取 GHCR 上的多架构镜像：
-
-```bash
-docker compose pull
-docker compose up -d
-docker compose logs -f codex-queue-bot
-```
-
-Compose 默认只把控制台映射到 `127.0.0.1:8080:8080`，适合由同机 HTTPS 反向代理对外提供。若确需直接暴露端口，应同时保留 `cookie_secure=true` 并使用 TLS。
-
-默认镜像是 `ghcr.io/alliottech/codex-queue-bot:latest`。可通过环境变量选择固定标签：
-
-```bash
-CODEX_QUEUE_BOT_IMAGE=ghcr.io/alliottech/codex-queue-bot:v1.0.0 \
-  docker compose up -d
-```
-
-如果 GHCR 包为私有，需要先使用具有 `read:packages` 权限的 GitHub PAT 登录：
-
-```bash
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u AlliotTech --password-stdin
-```
-
-镜像构建阶段默认安装官方 `@openai/codex@latest`，并提取平台对应的原生 Codex 二进制；最终运行层不携带 Node/npm。需要复现或验证特定版本时，可本地显式覆盖：
-
-```bash
-docker build \
-  --build-arg CODEX_VERSION=0.148.0 \
-  -t codex-queue-bot:local .
-```
-
-Compose 通过只读挂载提供 `config.json` 和 `prompts.txt`，Key 通过环境变量注入，不会写入镜像。
-
-### GitHub Actions / GHCR
-
-推送到 `main`、版本标签或手动触发工作流时，GitHub Actions 会构建 `linux/amd64` 和 `linux/arm64` 镜像并发布到 GHCR：
-
-- 默认分支：`latest`、`main`、`sha-<commit>`
-- Git 标签：同名标签、`sha-<commit>`
-- Pull Request：只验证构建，不推送镜像
-
-工作流仅授予 `contents: read` 和 `packages: write`，发布认证使用 GitHub 自动提供的短期 `GITHUB_TOKEN`，仓库中不保存 GHCR 密钥。
-
-### 出站代理
-
-容器运行时会统一读取以下标准代理环境变量：
-
-- `HTTP_PROXY` / `http_proxy`
-- `HTTPS_PROXY` / `https_proxy`
-- `ALL_PROXY` / `all_proxy`
-- `NO_PROXY` / `no_proxy`
-
-只配置一个代理变量即可覆盖全部出站请求。例如在 `.env` 中配置：
-
-```dotenv
-HTTP_PROXY=socks5://host.docker.internal:1080
-NO_PROXY=localhost,127.0.0.1
-```
-
-该代理会同时用于 OpenILink Hub 的 HTTP、WebSocket 连接和 Codex API 请求。缺失的 `HTTPS_PROXY`、`ALL_PROXY` 会自动沿用已配置的代理；如果分别配置了 HTTP 和 HTTPS 代理，则保留各自的值。代理值推荐使用 `http://` 或 `socks5://` URL，也兼容 `socks5:host:port` 简写，但建议使用带 `//` 的标准形式。`NO_PROXY` 中的地址会直连。
-
-## Codex 调用方式
-
-每次尝试都会直接执行 `codex exec`，不依赖 `c=codex --yolo` 等 shell alias。主要隔离参数包括：
-
-```text
---ignore-user-config
---ephemeral
---skip-git-repo-check
---ignore-rules
---sandbox read-only
--c shell_environment_policy.inherit="none"
---output-last-message <临时文件>
-```
-
-程序为每个目标动态配置独立的 custom model provider：`base_url`、`env_key`、`wire_api="responses"`。这与 OpenAI Docs 中的非交互 `codex exec` 和自定义 provider 配置一致：
-
-- [Codex CLI reference](https://developers.openai.com/codex/cli/reference/#codex-exec)
-- [Codex advanced configuration](https://developers.openai.com/codex/config-advanced/#custom-model-providers)
-
-成功条件是 Codex 退出码为 `0`，并且 `--output-last-message` 产生非空最终响应。
-
-Codex 进程只会继承运行所需的环境白名单，包括 `PATH`、`HOME`、临时目录、语言区域、代理和 CA 证书设置，再额外加入当前目标 Key。`shell_environment_policy.inherit="none"` 会阻止 Codex 启动的命令继承该 Key；这项隔离配置在用户自定义 `config_overrides` 之后强制追加，不能被覆盖。
-
-## Prompt
-
-默认使用 [prompts.txt](prompts.txt)：
-
-- 每行一个 Prompt。
-- 空行和去掉行首空白后以 `#` 开头的行会被忽略。
-- 每次请求前重新读取，因此修改文件后无需重启。
-- 每次追加唯一请求 ID、尝试次数，以及“不读取文件、不调用工具、简短回答”的约束。
-
-## 测试
-
-```bash
-go test ./...
 go test -race ./...
 go vet ./...
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
-使用本机原生 Codex 二进制验证 Responses SSE 调用链：
-
-```bash
-RUN_NATIVE_CODEX_INTEGRATION=1 \
-CODEX_INTEGRATION_BINARY=codex \
-go test -tags=integration ./internal/codex \
-  -run TestRunnerWithNativeCodexBinary -v
-```
-
-已有测试覆盖配置和环境变量密钥解析、Codex 子进程参数隔离、失败重试/取消/成功通知、保活循环与停止、排队/保活互斥和共享并发限制，以及 OpenILink REST 发送与 WebSocket 事件接收。
-
-## 运行边界
-
-失败重试会持续到成功、收到 `/停止` 或进程退出。请根据目标站点的服务条款和限流规则设置合理的重试区间；默认使用 3～8 秒随机间隔，并强制最低 1 秒，避免无间隔紧循环。
-
-任务状态保存在内存中，容器重启后不会自动恢复此前正在运行的排队或保活任务，需要重新发送 `/开挤` 或 `/保活`。
-
-原来的 [codex-healthcheck.sh](codex-healthcheck.sh) 仍保留，可继续用于本机低频健康检查；新的 Go 服务和它互不依赖。
+健康检查地址：<http://127.0.0.1:8080/healthz>。

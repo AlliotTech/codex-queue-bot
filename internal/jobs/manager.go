@@ -2,11 +2,13 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -114,9 +116,12 @@ type KeepaliveSnapshot struct {
 }
 
 type TargetSnapshot struct {
+	ID        int64
+	SortOrder int
 	Name      string
 	Model     string
 	APIHost   string
+	Busy      bool
 	Queue     Snapshot
 	Keepalive KeepaliveSnapshot
 }
@@ -173,7 +178,6 @@ type Manager struct {
 	keepaliveMin   time.Duration
 	keepaliveMax   time.Duration
 	successMessage string
-	sem            chan struct{}
 	maxParallel    int
 	activityLimit  int
 
@@ -184,41 +188,47 @@ type Manager struct {
 	keepalives       map[string]*keepaliveJob
 	arbiters         map[string]*targetArbiter
 	currentProcesses int
+	slotsInUse       int
 	activities       []Activity
 	nextEventID      uint64
 	nextObserverID   uint64
 	observers        map[uint64]chan Event
 	runWG            sync.WaitGroup
 	shuttingDown     bool
+	parallelChanged  chan struct{}
 }
 
 type job struct {
-	state       State
-	attempts    int
-	startedAt   time.Time
-	lastAttempt time.Time
-	nextAttempt time.Time
-	finishedAt  time.Time
-	lastError   string
-	runID       uint64
-	cancel      context.CancelFunc
-	subscribers map[string]Subscriber
-	operation   Operation
+	state           State
+	attempts        int
+	startedAt       time.Time
+	lastAttempt     time.Time
+	nextAttempt     time.Time
+	finishedAt      time.Time
+	lastError       string
+	runID           uint64
+	cancel          context.CancelFunc
+	subscribers     map[string]Subscriber
+	operation       Operation
+	scheduleChanged chan struct{}
+	workers         int
 }
 
 type keepaliveJob struct {
-	state       KeepaliveState
-	requests    int
-	startedAt   time.Time
-	lastRequest time.Time
-	lastSuccess time.Time
-	lastFailure time.Time
-	nextRequest time.Time
-	stoppedAt   time.Time
-	lastError   string
-	runID       uint64
-	cancel      context.CancelFunc
-	operation   Operation
+	state           KeepaliveState
+	requests        int
+	startedAt       time.Time
+	lastRequest     time.Time
+	lastSuccess     time.Time
+	lastFailure     time.Time
+	nextRequest     time.Time
+	stoppedAt       time.Time
+	lastError       string
+	runID           uint64
+	cancel          context.CancelFunc
+	operation       Operation
+	scheduleChanged chan struct{}
+	workers         int
 }
 
 type requestOwner uint8
@@ -234,6 +244,12 @@ type targetArbiter struct {
 	ownerRunID uint64
 	changed    chan struct{}
 }
+
+var (
+	ErrTargetBusy     = errors.New("target has an active queue or keepalive task")
+	ErrTargetNotFound = errors.New("target not found")
+	ErrTargetConflict = errors.New("target name already exists")
+)
 
 func New(
 	root context.Context,
@@ -251,35 +267,38 @@ func New(
 		logger = slog.Default()
 	}
 	limit := 200
-	if len(activityLimit) > 0 && activityLimit[0] > 0 {
+	if len(activityLimit) > 0 {
 		limit = activityLimit[0]
+		if limit < 0 {
+			limit = 0
+		}
 	}
 	m := &Manager{
-		root:           root,
-		runner:         runner,
-		messenger:      messenger,
-		logger:         logger,
-		retryMin:       retryMin,
-		retryMax:       retryMax,
-		keepaliveMin:   keepaliveMin,
-		keepaliveMax:   keepaliveMax,
-		successMessage: successMessage,
-		sem:            make(chan struct{}, maxParallel),
-		maxParallel:    maxParallel,
-		activityLimit:  limit,
-		targets:        make(map[string]config.Target, len(targets)),
-		jobs:           make(map[string]*job, len(targets)),
-		keepalives:     make(map[string]*keepaliveJob, len(targets)),
-		arbiters:       make(map[string]*targetArbiter, len(targets)),
-		activities:     make([]Activity, 0, limit),
-		observers:      make(map[uint64]chan Event),
+		root:            root,
+		runner:          runner,
+		messenger:       messenger,
+		logger:          logger,
+		retryMin:        retryMin,
+		retryMax:        retryMax,
+		keepaliveMin:    keepaliveMin,
+		keepaliveMax:    keepaliveMax,
+		successMessage:  successMessage,
+		maxParallel:     maxParallel,
+		activityLimit:   limit,
+		targets:         make(map[string]config.Target, len(targets)),
+		jobs:            make(map[string]*job, len(targets)),
+		keepalives:      make(map[string]*keepaliveJob, len(targets)),
+		arbiters:        make(map[string]*targetArbiter, len(targets)),
+		activities:      make([]Activity, 0, limit),
+		observers:       make(map[uint64]chan Event),
+		parallelChanged: make(chan struct{}),
 	}
 	for _, target := range targets {
 		key := normalizeName(target.Name)
 		m.targets[key] = target
 		m.order = append(m.order, key)
-		m.jobs[key] = &job{state: StateIdle, subscribers: make(map[string]Subscriber)}
-		m.keepalives[key] = &keepaliveJob{state: KeepaliveStateStopped}
+		m.jobs[key] = &job{state: StateIdle, subscribers: make(map[string]Subscriber), scheduleChanged: make(chan struct{})}
+		m.keepalives[key] = &keepaliveJob{state: KeepaliveStateStopped, scheduleChanged: make(chan struct{})}
 		m.arbiters[key] = &targetArbiter{changed: make(chan struct{})}
 	}
 	return m
@@ -290,12 +309,12 @@ func (m *Manager) Start(names []string, subscriber Subscriber) StartResult {
 }
 
 func (m *Manager) StartWithOperation(names []string, subscriber Subscriber, operation Operation) StartResult {
-	keys, unknown := m.resolve(names)
-	result := StartResult{Unknown: unknown}
 	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	keys, unknown := m.resolveLocked(names)
+	result := StartResult{Unknown: unknown}
 	if m.shuttingDown {
 		for _, key := range keys {
 			result.Already = append(result.Already, m.targets[key].Name)
@@ -331,8 +350,10 @@ func (m *Manager) StartWithOperation(names []string, subscriber Subscriber, oper
 		m.signalTargetLocked(key)
 		changed = true
 		m.runWG.Add(1)
+		current.workers++
 		go func() {
 			defer m.runWG.Done()
+			defer m.finishQueueWorker(key)
 			m.run(jobCtx, key, runID)
 		}()
 	}
@@ -348,11 +369,11 @@ func (m *Manager) Stop(names []string) StopResult {
 }
 
 func (m *Manager) StopWithOperation(names []string, operation Operation) StopResult {
-	keys, unknown := m.resolve(names)
-	result := StopResult{Unknown: unknown}
 	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
+	keys, unknown := m.resolveLocked(names)
+	result := StopResult{Unknown: unknown}
 	changed := false
 	for _, key := range keys {
 		target := m.targets[key]
@@ -388,12 +409,12 @@ func (m *Manager) StartKeepalive(names []string) KeepaliveStartResult {
 }
 
 func (m *Manager) StartKeepaliveWithOperation(names []string, operation Operation) KeepaliveStartResult {
-	keys, unknown := m.resolve(names)
-	result := KeepaliveStartResult{Unknown: unknown}
 	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	keys, unknown := m.resolveLocked(names)
+	result := KeepaliveStartResult{Unknown: unknown}
 	if m.shuttingDown {
 		for _, key := range keys {
 			result.Already = append(result.Already, m.targets[key].Name)
@@ -428,8 +449,10 @@ func (m *Manager) StartKeepaliveWithOperation(names []string, operation Operatio
 		m.signalTargetLocked(key)
 		changed = true
 		m.runWG.Add(1)
+		current.workers++
 		go func() {
 			defer m.runWG.Done()
+			defer m.finishKeepaliveWorker(key)
 			m.runKeepalive(keepaliveCtx, key, runID)
 		}()
 	}
@@ -445,11 +468,11 @@ func (m *Manager) StopKeepalive(names []string) KeepaliveStopResult {
 }
 
 func (m *Manager) StopKeepaliveWithOperation(names []string, operation Operation) KeepaliveStopResult {
-	keys, unknown := m.resolve(names)
-	result := KeepaliveStopResult{Unknown: unknown}
 	operation = normalizeOperation(operation)
 
 	m.mu.Lock()
+	keys, unknown := m.resolveLocked(names)
+	result := KeepaliveStopResult{Unknown: unknown}
 	changed := false
 	for _, key := range keys {
 		target := m.targets[key]
@@ -480,9 +503,9 @@ func (m *Manager) StopKeepaliveWithOperation(names []string, operation Operation
 }
 
 func (m *Manager) Snapshots(names []string) ([]Snapshot, []string) {
-	keys, unknown := m.resolve(names)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	keys, unknown := m.resolveLocked(names)
 
 	result := make([]Snapshot, 0, len(keys))
 	for _, key := range keys {
@@ -492,9 +515,9 @@ func (m *Manager) Snapshots(names []string) ([]Snapshot, []string) {
 }
 
 func (m *Manager) KeepaliveSnapshots(names []string) ([]KeepaliveSnapshot, []string) {
-	keys, unknown := m.resolve(names)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	keys, unknown := m.resolveLocked(names)
 
 	result := make([]KeepaliveSnapshot, 0, len(keys))
 	for _, key := range keys {
@@ -602,6 +625,218 @@ func (m *Manager) TargetNames() []string {
 	return names
 }
 
+// UpdateSettings applies request-level configuration without interrupting
+// running Codex processes. Waiting retry and keepalive timers are resampled
+// from the update instant when their interval changes.
+func (m *Manager) UpdateSettings(
+	retryMin, retryMax time.Duration,
+	keepaliveMin, keepaliveMax time.Duration,
+	maxParallel int,
+	successMessage string,
+	activityLimit int,
+) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	if retryMin != m.retryMin || retryMax != m.retryMax {
+		m.retryMin, m.retryMax = retryMin, retryMax
+		for key, current := range m.jobs {
+			if current.state == StateRunning && !current.nextAttempt.IsZero() {
+				current.nextAttempt = now.Add(randomDuration(m.retryMin, m.retryMax))
+				m.signalQueueScheduleLocked(key)
+			}
+		}
+	}
+	if keepaliveMin != m.keepaliveMin || keepaliveMax != m.keepaliveMax {
+		m.keepaliveMin, m.keepaliveMax = keepaliveMin, keepaliveMax
+		for key, current := range m.keepalives {
+			if current.state == KeepaliveStateWaitingNext && !current.nextRequest.IsZero() {
+				current.nextRequest = now.Add(randomDuration(m.keepaliveMin, m.keepaliveMax))
+				m.signalKeepaliveScheduleLocked(key)
+			}
+		}
+	}
+	if maxParallel > 0 && maxParallel != m.maxParallel {
+		m.maxParallel = maxParallel
+		m.signalParallelLocked()
+	}
+	m.successMessage = successMessage
+	if activityLimit < 0 {
+		activityLimit = 0
+	}
+	if activityLimit != m.activityLimit {
+		m.activityLimit = activityLimit
+		if len(m.activities) > activityLimit {
+			m.activities = append([]Activity(nil), m.activities[len(m.activities)-activityLimit:]...)
+		}
+	}
+	m.broadcastStateLocked()
+}
+
+func (m *Manager) TargetByID(id int64) (config.Target, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key, ok := m.targetKeyByIDLocked(id)
+	if !ok {
+		return config.Target{}, false
+	}
+	return m.targets[key], true
+}
+
+// CreateTarget serializes persistence with target resolution so commands
+// cannot start a just-created target in a partially applied state.
+func (m *Manager) CreateTarget(target *config.Target, persist func() error) error {
+	if target == nil {
+		return ErrTargetNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := normalizeName(target.Name)
+	if _, exists := m.targets[key]; exists {
+		return ErrTargetConflict
+	}
+	if persist != nil {
+		if err := persist(); err != nil {
+			return err
+		}
+	}
+	key = normalizeName(target.Name)
+	if _, exists := m.targets[key]; exists {
+		return ErrTargetConflict
+	}
+	m.targets[key] = *target
+	m.jobs[key] = &job{state: StateIdle, subscribers: make(map[string]Subscriber), scheduleChanged: make(chan struct{})}
+	m.keepalives[key] = &keepaliveJob{state: KeepaliveStateStopped, scheduleChanged: make(chan struct{})}
+	m.arbiters[key] = &targetArbiter{changed: make(chan struct{})}
+	m.order = append(m.order, key)
+	m.sortTargetsLocked()
+	m.broadcastStateLocked()
+	return nil
+}
+
+func (m *Manager) UpdateTarget(id int64, target *config.Target, persist func() error) error {
+	if target == nil {
+		return ErrTargetNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	oldKey, ok := m.targetKeyByIDLocked(id)
+	if !ok {
+		return ErrTargetNotFound
+	}
+	if m.targetBusyLocked(oldKey) {
+		return ErrTargetBusy
+	}
+	newKey := normalizeName(target.Name)
+	if existing, exists := m.targets[newKey]; exists && existing.ID != id {
+		return ErrTargetConflict
+	}
+	if persist != nil {
+		if err := persist(); err != nil {
+			return err
+		}
+	}
+	newKey = normalizeName(target.Name)
+	if existing, exists := m.targets[newKey]; exists && existing.ID != id {
+		return ErrTargetConflict
+	}
+	if newKey != oldKey {
+		currentJob := m.jobs[oldKey]
+		currentKeepalive := m.keepalives[oldKey]
+		currentArbiter := m.arbiters[oldKey]
+		delete(m.targets, oldKey)
+		delete(m.jobs, oldKey)
+		delete(m.keepalives, oldKey)
+		delete(m.arbiters, oldKey)
+		m.jobs[newKey] = currentJob
+		m.keepalives[newKey] = currentKeepalive
+		m.arbiters[newKey] = currentArbiter
+		for index := range m.order {
+			if m.order[index] == oldKey {
+				m.order[index] = newKey
+				break
+			}
+		}
+	}
+	m.targets[newKey] = *target
+	m.sortTargetsLocked()
+	m.broadcastStateLocked()
+	return nil
+}
+
+func (m *Manager) DeleteTarget(id int64, persist func() error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key, ok := m.targetKeyByIDLocked(id)
+	if !ok {
+		return ErrTargetNotFound
+	}
+	if m.targetBusyLocked(key) {
+		return ErrTargetBusy
+	}
+	if persist != nil {
+		if err := persist(); err != nil {
+			return err
+		}
+	}
+	delete(m.targets, key)
+	delete(m.jobs, key)
+	delete(m.keepalives, key)
+	delete(m.arbiters, key)
+	for index := range m.order {
+		if m.order[index] == key {
+			m.order = append(m.order[:index], m.order[index+1:]...)
+			break
+		}
+	}
+	m.broadcastStateLocked()
+	return nil
+}
+
+func (m *Manager) targetKeyByIDLocked(id int64) (string, bool) {
+	for _, key := range m.order {
+		if m.targets[key].ID == id {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+func (m *Manager) targetBusyLocked(key string) bool {
+	return m.jobs[key].state == StateRunning || m.jobs[key].workers > 0 || m.keepalives[key].state != KeepaliveStateStopped || m.keepalives[key].workers > 0
+}
+
+func (m *Manager) finishQueueWorker(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.jobs[key]; ok && current.workers > 0 {
+		current.workers--
+		m.broadcastStateLocked()
+	}
+}
+
+func (m *Manager) finishKeepaliveWorker(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.keepalives[key]; ok && current.workers > 0 {
+		current.workers--
+		m.broadcastStateLocked()
+	}
+}
+
+func (m *Manager) sortTargetsLocked() {
+	sort.SliceStable(m.order, func(i, j int) bool {
+		left, right := m.targets[m.order[i]], m.targets[m.order[j]]
+		if left.SortOrder != right.SortOrder {
+			return left.SortOrder < right.SortOrder
+		}
+		if left.ID != right.ID {
+			return left.ID < right.ID
+		}
+		return strings.ToLower(left.Name) < strings.ToLower(right.Name)
+	})
+}
+
 func (m *Manager) queueSnapshotLocked(key string) Snapshot {
 	target := m.targets[key]
 	current := m.jobs[key]
@@ -645,12 +880,16 @@ func (m *Manager) snapshotLocked() ManagerSnapshot {
 		MaxParallel:      m.maxParallel,
 	}
 	for _, key := range m.order {
+		target := m.targets[key]
 		queue := m.queueSnapshotLocked(key)
 		keepalive := m.keepaliveSnapshotLocked(key)
 		snapshot.Targets = append(snapshot.Targets, TargetSnapshot{
+			ID:        target.ID,
+			SortOrder: target.SortOrder,
 			Name:      queue.Name,
 			Model:     queue.Model,
 			APIHost:   queue.APIHost,
+			Busy:      m.targetBusyLocked(key),
 			Queue:     queue,
 			Keepalive: keepalive,
 		})
@@ -743,12 +982,12 @@ func (m *Manager) run(ctx context.Context, key string, runID uint64) {
 			return
 		}
 
-		delay := randomDuration(m.retryMin, m.retryMax)
-		if !m.markFailure(key, runID, result, delay) {
+		delay, ok := m.markFailure(key, runID, result)
+		if !ok {
 			return
 		}
 		m.logger.Warn("Codex queue attempt failed", "target", target.Name, "attempt", attempt, "error", sanitizeTargetError(target, result.Error), "retry_in", delay)
-		if !wait(ctx, delay) {
+		if !m.waitQueueRetry(ctx, key, runID) {
 			m.markQueueCancelled(key, runID)
 			return
 		}
@@ -770,8 +1009,8 @@ func (m *Manager) runKeepalive(ctx context.Context, key string, runID uint64) {
 			m.markKeepaliveCancelled(key, runID)
 			return
 		}
-		delay := randomDuration(m.keepaliveMin, m.keepaliveMax)
-		if !m.finishKeepaliveRequest(key, runID, result, delay) {
+		delay, ok := m.finishKeepaliveRequest(key, runID, result)
+		if !ok {
 			return
 		}
 		if result.Success {
@@ -779,7 +1018,7 @@ func (m *Manager) runKeepalive(ctx context.Context, key string, runID uint64) {
 		} else {
 			m.logger.Warn("Codex keepalive request failed", "target", target.Name, "request", request, "error", sanitizeTargetError(target, result.Error), "next_in", delay)
 		}
-		if !wait(ctx, delay) {
+		if !m.waitKeepaliveNext(ctx, key, runID) {
 			m.markKeepaliveCancelled(key, runID)
 			return
 		}
@@ -903,11 +1142,12 @@ func (m *Manager) beginAttempt(key string, runID uint64) (int, config.Target, bo
 	return current.attempts, m.targets[key], true
 }
 
-func (m *Manager) markFailure(key string, runID uint64, result codex.Result, delay time.Duration) bool {
+func (m *Manager) markFailure(key string, runID uint64, result codex.Result) (time.Duration, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current := m.jobs[key]
 	valid := current.runID == runID && current.state == StateRunning
+	delay := randomDuration(m.retryMin, m.retryMax)
 	if valid {
 		target := m.targets[key]
 		current.lastError = sanitizeTargetError(target, result.Error)
@@ -918,7 +1158,7 @@ func (m *Manager) markFailure(key string, runID uint64, result codex.Result, del
 	if valid {
 		m.broadcastStateLocked()
 	}
-	return valid
+	return delay, valid
 }
 
 func (m *Manager) markSuccess(key string, runID uint64) ([]Subscriber, time.Duration, bool) {
@@ -949,15 +1189,16 @@ func (m *Manager) markSuccess(key string, runID uint64) ([]Subscriber, time.Dura
 	return subscribers, current.finishedAt.Sub(current.startedAt), true
 }
 
-func (m *Manager) finishKeepaliveRequest(key string, runID uint64, result codex.Result, delay time.Duration) bool {
+func (m *Manager) finishKeepaliveRequest(key string, runID uint64, result codex.Result) (time.Duration, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current := m.keepalives[key]
 	if current.runID != runID || current.state == KeepaliveStateStopped {
 		m.releaseTargetLocked(key, requestOwnerKeepalive, runID)
-		return false
+		return 0, false
 	}
 	now := time.Now()
+	delay := randomDuration(m.keepaliveMin, m.keepaliveMax)
 	if result.Success {
 		current.lastSuccess = now
 	} else {
@@ -976,7 +1217,7 @@ func (m *Manager) finishKeepaliveRequest(key string, runID uint64, result codex.
 	m.recordActivityLocked(activityType, target.Name, current.operation, current.requests, activityError)
 	m.releaseTargetLocked(key, requestOwnerKeepalive, runID)
 	m.broadcastStateLocked()
-	return true
+	return delay, true
 }
 
 func (m *Manager) markQueueCancelled(key string, runID uint64) {
@@ -1042,7 +1283,10 @@ func (m *Manager) notifySuccess(target string, attempt int, elapsed time.Duratio
 	if m.messenger == nil {
 		return
 	}
-	message := fmt.Sprintf("✅ %s：%s（第 %d 次，耗时 %s）", target, m.successMessage, attempt, formatDuration(elapsed))
+	m.mu.Lock()
+	successMessage := m.successMessage
+	m.mu.Unlock()
+	message := fmt.Sprintf("✅ %s：%s（第 %d 次，耗时 %s）", target, successMessage, attempt, formatDuration(elapsed))
 	for _, subscriber := range subscribers {
 		subscriber := subscriber
 		go m.notifySubscriber(target, message, subscriber)
@@ -1066,7 +1310,7 @@ func (m *Manager) notifySubscriber(target, message string, subscriber Subscriber
 	}
 }
 
-func (m *Manager) resolve(names []string) ([]string, []string) {
+func (m *Manager) resolveLocked(names []string) ([]string, []string) {
 	if len(names) == 0 || containsAll(names) {
 		return append([]string(nil), m.order...), nil
 	}
@@ -1091,11 +1335,20 @@ func (m *Manager) resolve(names []string) ([]string, []string) {
 }
 
 func (m *Manager) acquire(ctx context.Context) bool {
-	select {
-	case m.sem <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
+	for {
+		m.mu.Lock()
+		if m.slotsInUse < m.maxParallel {
+			m.slotsInUse++
+			m.mu.Unlock()
+			return true
+		}
+		changed := m.parallelChanged
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-changed:
+		}
 	}
 }
 
@@ -1104,13 +1357,106 @@ func (m *Manager) finishProcess() {
 	if m.currentProcesses > 0 {
 		m.currentProcesses--
 	}
+	if m.slotsInUse > 0 {
+		m.slotsInUse--
+	}
+	m.signalParallelLocked()
 	m.broadcastStateLocked()
 	m.mu.Unlock()
-	<-m.sem
 }
 
 func (m *Manager) releaseSlot() {
-	<-m.sem
+	m.mu.Lock()
+	if m.slotsInUse > 0 {
+		m.slotsInUse--
+	}
+	m.signalParallelLocked()
+	m.mu.Unlock()
+}
+
+func (m *Manager) signalParallelLocked() {
+	close(m.parallelChanged)
+	m.parallelChanged = make(chan struct{})
+}
+
+func (m *Manager) waitQueueRetry(ctx context.Context, key string, runID uint64) bool {
+	for {
+		m.mu.Lock()
+		current, ok := m.jobs[key]
+		if !ok || current.runID != runID || current.state != StateRunning {
+			m.mu.Unlock()
+			return false
+		}
+		at := current.nextAttempt
+		changed := current.scheduleChanged
+		m.mu.Unlock()
+		remaining := time.Until(at)
+		if remaining <= 0 {
+			return true
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return false
+		case <-changed:
+			stopTimer(timer)
+			continue
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
+func (m *Manager) waitKeepaliveNext(ctx context.Context, key string, runID uint64) bool {
+	for {
+		m.mu.Lock()
+		current, ok := m.keepalives[key]
+		if !ok || current.runID != runID || current.state == KeepaliveStateStopped {
+			m.mu.Unlock()
+			return false
+		}
+		at := current.nextRequest
+		changed := current.scheduleChanged
+		m.mu.Unlock()
+		remaining := time.Until(at)
+		if remaining <= 0 {
+			return true
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return false
+		case <-changed:
+			stopTimer(timer)
+			continue
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
+func (m *Manager) signalQueueScheduleLocked(key string) {
+	current := m.jobs[key]
+	close(current.scheduleChanged)
+	current.scheduleChanged = make(chan struct{})
+}
+
+func (m *Manager) signalKeepaliveScheduleLocked(key string) {
+	current := m.keepalives[key]
+	close(current.scheduleChanged)
+	current.scheduleChanged = make(chan struct{})
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
 }
 
 func normalizeName(value string) string {

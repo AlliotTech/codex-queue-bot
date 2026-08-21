@@ -8,20 +8,26 @@ import (
 )
 
 type dashboardResponse struct {
-	Version     string              `json:"version"`
-	GeneratedAt time.Time           `json:"generated_at"`
-	OpenILink   openILinkResponse   `json:"openilink"`
-	Concurrency concurrencyResponse `json:"concurrency"`
-	Targets     []targetResponse    `json:"targets"`
-	Activities  []activityResponse  `json:"activities"`
+	Version         string              `json:"version"`
+	GeneratedAt     time.Time           `json:"generated_at"`
+	ConfigRevision  int64               `json:"config_revision"`
+	RestartRequired bool                `json:"restart_required"`
+	RestartFields   []string            `json:"restart_fields"`
+	OpenILink       openILinkResponse   `json:"openilink"`
+	Concurrency     concurrencyResponse `json:"concurrency"`
+	Targets         []targetResponse    `json:"targets"`
+	Activities      []activityResponse  `json:"activities"`
 }
 
 type stateResponse struct {
-	Version     string              `json:"version"`
-	GeneratedAt time.Time           `json:"generated_at"`
-	OpenILink   openILinkResponse   `json:"openilink"`
-	Concurrency concurrencyResponse `json:"concurrency"`
-	Targets     []targetResponse    `json:"targets"`
+	Version         string              `json:"version"`
+	GeneratedAt     time.Time           `json:"generated_at"`
+	ConfigRevision  int64               `json:"config_revision"`
+	RestartRequired bool                `json:"restart_required"`
+	RestartFields   []string            `json:"restart_fields"`
+	OpenILink       openILinkResponse   `json:"openilink"`
+	Concurrency     concurrencyResponse `json:"concurrency"`
+	Targets         []targetResponse    `json:"targets"`
 }
 
 type openILinkResponse struct {
@@ -36,9 +42,11 @@ type concurrencyResponse struct {
 }
 
 type targetResponse struct {
+	ID        int64             `json:"id"`
 	Name      string            `json:"name"`
 	Model     string            `json:"model"`
 	APIHost   string            `json:"api_host"`
+	Busy      bool              `json:"busy"`
 	Queue     queueResponse     `json:"queue"`
 	Keepalive keepaliveResponse `json:"keepalive"`
 }
@@ -79,12 +87,10 @@ type activityResponse struct {
 func (s *Server) dashboardPayload(snapshot jobs.ManagerSnapshot, activities []jobs.Activity, status hub.StatusSnapshot) dashboardResponse {
 	state := s.statePayload(snapshot, status)
 	result := dashboardResponse{
-		Version:     state.Version,
-		GeneratedAt: state.GeneratedAt,
-		OpenILink:   state.OpenILink,
-		Concurrency: state.Concurrency,
-		Targets:     state.Targets,
-		Activities:  make([]activityResponse, 0, len(activities)),
+		Version: state.Version, GeneratedAt: state.GeneratedAt,
+		ConfigRevision: state.ConfigRevision, RestartRequired: state.RestartRequired, RestartFields: state.RestartFields,
+		OpenILink: state.OpenILink, Concurrency: state.Concurrency, Targets: state.Targets,
+		Activities: make([]activityResponse, 0, len(activities)),
 	}
 	for _, activity := range activities {
 		result.Activities = append(result.Activities, makeActivityResponse(activity))
@@ -93,9 +99,11 @@ func (s *Server) dashboardPayload(snapshot jobs.ManagerSnapshot, activities []jo
 }
 
 func (s *Server) statePayload(snapshot jobs.ManagerSnapshot, status hub.StatusSnapshot) stateResponse {
+	configuration := s.currentConfiguration()
+	restartFields := s.restartFields(configuration.Config)
 	result := stateResponse{
-		Version:     s.version,
-		GeneratedAt: s.now(),
+		Version: s.version, GeneratedAt: s.now(), ConfigRevision: configuration.Revision,
+		RestartRequired: len(restartFields) > 0, RestartFields: restartFields,
 		OpenILink: openILinkResponse{
 			State:     status.State,
 			Error:     status.Error,
@@ -106,9 +114,11 @@ func (s *Server) statePayload(snapshot jobs.ManagerSnapshot, status hub.StatusSn
 	}
 	for _, target := range snapshot.Targets {
 		result.Targets = append(result.Targets, targetResponse{
+			ID:      target.ID,
 			Name:    target.Name,
 			Model:   target.Model,
 			APIHost: target.APIHost,
+			Busy:    target.Busy,
 			Queue: queueResponse{
 				State:       target.Queue.State,
 				Attempts:    target.Queue.Attempts,

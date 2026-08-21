@@ -52,7 +52,8 @@ WORKDIR /app
 COPY --from=builder /out/codex-queue-bot /usr/local/bin/codex-queue-bot
 COPY --from=codex-dist /out/codex /usr/local/bin/codex
 COPY prompts.txt /app/prompts.txt
+RUN mkdir -p /app/data && chmod 0700 /app/data && chown -R 10001:10001 /app/data
 
 USER 10001:10001
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/codex-queue-bot"]
-CMD ["-config", "/app/config.json"]
+CMD ["-db", "/app/data/codex-queue-bot.db", "-config", "/app/config.json"]

@@ -10,8 +10,14 @@ services:
         required: false
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      CODEX_QUEUE_MASTER_KEY: ${CODEX_QUEUE_MASTER_KEY:?set CODEX_QUEUE_MASTER_KEY to Base64-encoded 32 bytes}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./config.json:/app/config.json:ro
+      - codex-queue-data:/app/data
       - ./prompts.txt:/app/prompts.txt:ro
+      # For a one-time legacy migration, temporarily add:
+      # - ./config.json:/app/config.json:ro
+
+volumes:
+  codex-queue-data:

@@ -30,12 +30,21 @@ const (
 )
 
 type Runner struct {
+	mu              sync.RWMutex
 	Binary          string
 	PromptsFile     string
 	Timeout         time.Duration
 	ReasoningEffort string
 	Overrides       []string
 	Logger          *slog.Logger
+}
+
+type runnerSettings struct {
+	Binary          string
+	PromptsFile     string
+	Timeout         time.Duration
+	ReasoningEffort string
+	Overrides       []string
 }
 
 type Result struct {
@@ -46,18 +55,21 @@ type Result struct {
 }
 
 func (r *Runner) Check() error {
-	resolved, err := exec.LookPath(r.Binary)
+	settings := r.snapshot()
+	resolved, err := exec.LookPath(settings.Binary)
 	if err != nil {
-		return fmt.Errorf("find Codex executable %q: %w", r.Binary, err)
+		return fmt.Errorf("find Codex executable %q: %w", settings.Binary, err)
 	}
 	if !filepath.IsAbs(resolved) {
 		resolved, err = filepath.Abs(resolved)
 		if err != nil {
-			return fmt.Errorf("resolve Codex executable %q: %w", r.Binary, err)
+			return fmt.Errorf("resolve Codex executable %q: %w", settings.Binary, err)
 		}
 	}
+	r.mu.Lock()
 	r.Binary = resolved
-	if _, err := readPrompts(r.PromptsFile); err != nil {
+	r.mu.Unlock()
+	if _, err := readPrompts(settings.PromptsFile); err != nil {
 		return err
 	}
 	return nil
@@ -66,8 +78,9 @@ func (r *Runner) Check() error {
 func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Result {
 	started := time.Now()
 	result := Result{}
+	settings := r.snapshot()
 
-	prompt, err := pickPrompt(r.PromptsFile)
+	prompt, err := pickPrompt(settings.PromptsFile)
 	if err != nil {
 		result.Error = err.Error()
 		result.Duration = time.Since(started)
@@ -94,11 +107,11 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 
 	requestID := newRequestID()
 	fullPrompt := fmt.Sprintf("%s\n\nAnswer concisely in at most 80 words. Do not inspect local files, run commands, browse, or use tools. Request ID: %s. Attempt: %d", prompt, requestID, attempt)
-	args := r.args(target, workspace, responsePath, fullPrompt)
+	args := r.argsWithSettings(settings, target, workspace, responsePath, fullPrompt)
 
-	requestCtx, cancel := context.WithTimeout(ctx, r.Timeout)
+	requestCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
 	defer cancel()
-	cmd := exec.Command(r.Binary, args...)
+	cmd := exec.Command(settings.Binary, args...)
 	cmd.Dir = workspace
 	cmd.Env = codexEnvironment(os.Environ(), target.APIKey)
 
@@ -110,7 +123,7 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 	diagnostic = redact(diagnostic, target.APIKey)
 	if requestCtx.Err() != nil {
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-			result.Error = fmt.Sprintf("request timed out after %s", r.Timeout)
+			result.Error = fmt.Sprintf("request timed out after %s", settings.Timeout)
 		} else {
 			result.Error = "request cancelled"
 		}
@@ -148,6 +161,10 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 }
 
 func (r *Runner) args(target config.Target, workspace, responsePath, prompt string) []string {
+	return r.argsWithSettings(r.snapshot(), target, workspace, responsePath, prompt)
+}
+
+func (r *Runner) argsWithSettings(settings runnerSettings, target config.Target, workspace, responsePath, prompt string) []string {
 	args := []string{
 		"exec",
 		"--ignore-user-config",
@@ -164,7 +181,7 @@ func (r *Runner) args(target config.Target, workspace, responsePath, prompt stri
 		"-c", tomlAssignment("model_providers."+providerID+".env_key", apiKeyEnvName),
 		"-c", tomlAssignment("model_providers."+providerID+".wire_api", target.WireAPI),
 		"-c", "model_providers." + providerID + ".requires_openai_auth=false",
-		"-c", tomlAssignment("model_reasoning_effort", r.ReasoningEffort),
+		"-c", tomlAssignment("model_reasoning_effort", settings.ReasoningEffort),
 		"-c", "project_doc_max_bytes=0",
 		"-c", "history.persistence=\"none\"",
 		"-c", "features.memories=false",
@@ -174,7 +191,7 @@ func (r *Runner) args(target config.Target, workspace, responsePath, prompt stri
 		"-c", "notify=[]",
 		"-c", "disable_response_storage=true",
 	}
-	for _, override := range r.Overrides {
+	for _, override := range settings.Overrides {
 		args = append(args, "-c", override)
 	}
 	for _, override := range target.ConfigOverrides {
@@ -185,6 +202,28 @@ func (r *Runner) args(target config.Target, workspace, responsePath, prompt stri
 	args = append(args, "-c", "shell_environment_policy.inherit=\"none\"")
 	args = append(args, "--output-last-message", responsePath, prompt)
 	return args
+}
+
+// UpdateRuntime changes request-level settings for future Run calls. Each Run
+// snapshots all settings at its start, so in-flight requests are unaffected.
+func (r *Runner) UpdateRuntime(timeout time.Duration, reasoningEffort string, overrides []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Timeout = timeout
+	r.ReasoningEffort = reasoningEffort
+	r.Overrides = append([]string(nil), overrides...)
+}
+
+func (r *Runner) snapshot() runnerSettings {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return runnerSettings{
+		Binary:          r.Binary,
+		PromptsFile:     r.PromptsFile,
+		Timeout:         r.Timeout,
+		ReasoningEffort: r.ReasoningEffort,
+		Overrides:       append([]string(nil), r.Overrides...),
+	}
 }
 
 func (r *Runner) removeWorkspace(path string) {

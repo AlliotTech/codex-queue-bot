@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -18,8 +19,11 @@ import (
 	"sync"
 	"time"
 
+	"codex-queue-bot/internal/codex"
+	appconfig "codex-queue-bot/internal/config"
 	"codex-queue-bot/internal/hub"
 	"codex-queue-bot/internal/jobs"
+	"codex-queue-bot/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
@@ -48,6 +52,9 @@ type Options struct {
 	ObserverBuffer    int
 	Now               func() time.Time
 	Assets            fs.FS
+	ConfigStore       *storage.Store
+	InitialConfig     storage.Snapshot
+	Runner            *codex.Runner
 }
 
 type Server struct {
@@ -65,10 +72,19 @@ type Server struct {
 	now            func() time.Time
 	assets         fs.FS
 	engine         *gin.Engine
+	configStore    *storage.Store
+	runner         *codex.Runner
+	startupConfig  appconfig.Config
 
-	mu       sync.Mutex
-	sessions map[string]session
-	failures map[string][]time.Time
+	mu              sync.Mutex
+	sessions        map[string]session
+	failures        map[string][]time.Time
+	sessionsChanged chan struct{}
+
+	configMu       sync.RWMutex
+	configSnapshot storage.Snapshot
+	configChanged  chan struct{}
+	configWriteMu  sync.Mutex
 }
 
 type session struct {
@@ -108,11 +124,19 @@ func New(options Options) (*Server, error) {
 		options.OpenILinkStatus = hub.NewStatusStore(hub.StatusDisabled)
 	}
 	options.Username = strings.TrimSpace(options.Username)
-	if options.Username == "" {
-		return nil, errors.New("web administrator username is required")
-	}
-	if len([]rune(options.Password)) < 12 {
-		return nil, errors.New("web administrator password must be at least 12 characters")
+	if options.ConfigStore == nil {
+		if options.Username == "" {
+			return nil, errors.New("web administrator username is required")
+		}
+		if len([]rune(options.Password)) < 12 {
+			return nil, errors.New("web administrator password must be at least 12 characters")
+		}
+	} else if options.InitialConfig.Revision == 0 {
+		loaded, err := options.ConfigStore.Load(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("load Web configuration: %w", err)
+		}
+		options.InitialConfig = loaded
 	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
@@ -138,21 +162,29 @@ func New(options Options) (*Server, error) {
 	}
 
 	server := &Server{
-		manager:        options.Manager,
-		status:         options.OpenILinkStatus,
-		username:       options.Username,
-		passwordHash:   sha256.Sum256([]byte(options.Password)),
-		cookieSecure:   options.CookieSecure,
-		version:        options.Version,
-		logger:         options.Logger,
-		shutdown:       options.Shutdown,
-		sessionTTL:     options.SessionTTL,
-		heartbeat:      options.HeartbeatInterval,
-		observerBuffer: options.ObserverBuffer,
-		now:            options.Now,
-		assets:         options.Assets,
-		sessions:       make(map[string]session),
-		failures:       make(map[string][]time.Time),
+		manager:         options.Manager,
+		status:          options.OpenILinkStatus,
+		username:        options.Username,
+		passwordHash:    sha256.Sum256([]byte(options.Password)),
+		cookieSecure:    options.CookieSecure,
+		version:         options.Version,
+		logger:          options.Logger,
+		shutdown:        options.Shutdown,
+		sessionTTL:      options.SessionTTL,
+		heartbeat:       options.HeartbeatInterval,
+		observerBuffer:  options.ObserverBuffer,
+		now:             options.Now,
+		assets:          options.Assets,
+		configStore:     options.ConfigStore,
+		runner:          options.Runner,
+		sessions:        make(map[string]session),
+		failures:        make(map[string][]time.Time),
+		sessionsChanged: make(chan struct{}),
+		configChanged:   make(chan struct{}),
+	}
+	if options.ConfigStore != nil {
+		server.configSnapshot = options.InitialConfig
+		server.startupConfig = options.InitialConfig.Config
 	}
 	if server.version == "" {
 		server.version = "dev"
@@ -181,6 +213,8 @@ func (s *Server) routes() {
 		c.Header("Cache-Control", "no-store")
 		c.Next()
 	})
+	api.GET("/setup/status", s.setupStatus)
+	api.POST("/setup", s.setup)
 	api.POST("/auth/login", s.login)
 
 	authorized := api.Group("")
@@ -190,6 +224,14 @@ func (s *Server) routes() {
 	authorized.GET("/dashboard", s.dashboard)
 	authorized.POST("/actions", s.requireCSRF(), s.actions)
 	authorized.GET("/events", s.events)
+	authorized.GET("/config", s.getConfig)
+	authorized.PUT("/config/codex", s.requireCSRF(), s.updateCodexConfig)
+	authorized.PUT("/config/openilink", s.requireCSRF(), s.updateOpenILinkConfig)
+	authorized.PUT("/config/web", s.requireCSRF(), s.updateWebConfig)
+	authorized.PUT("/account", s.requireCSRF(), s.updateAccount)
+	authorized.POST("/targets", s.requireCSRF(), s.createTarget)
+	authorized.PUT("/targets/:id", s.requireCSRF(), s.updateTarget)
+	authorized.DELETE("/targets/:id", s.requireCSRF(), s.deleteTarget)
 
 	s.engine.NoRoute(s.serveUI)
 }
@@ -216,12 +258,25 @@ func (s *Server) login(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名或密码错误"})
 		return
 	}
-	usernameHash := sha256.Sum256([]byte(request.Username))
-	expectedUsernameHash := sha256.Sum256([]byte(s.username))
-	passwordHash := sha256.Sum256([]byte(request.Password))
-	usernameOK := subtle.ConstantTimeCompare(usernameHash[:], expectedUsernameHash[:]) == 1
-	passwordOK := subtle.ConstantTimeCompare(passwordHash[:], s.passwordHash[:]) == 1
-	if !usernameOK || !passwordOK {
+	authenticatedUsername := s.username
+	authenticated := false
+	if s.configStore != nil {
+		var err error
+		authenticatedUsername, authenticated, err = s.configStore.VerifyAdmin(c.Request.Context(), request.Username, request.Password)
+		if err != nil {
+			s.logger.Error("failed to verify administrator credentials", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "暂时无法登录"})
+			return
+		}
+	} else {
+		usernameHash := sha256.Sum256([]byte(request.Username))
+		expectedUsernameHash := sha256.Sum256([]byte(s.username))
+		passwordHash := sha256.Sum256([]byte(request.Password))
+		usernameOK := subtle.ConstantTimeCompare(usernameHash[:], expectedUsernameHash[:]) == 1
+		passwordOK := subtle.ConstantTimeCompare(passwordHash[:], s.passwordHash[:]) == 1
+		authenticated = usernameOK && passwordOK
+	}
+	if !authenticated {
 		s.recordLoginFailure(clientIP)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
@@ -232,28 +287,18 @@ func (s *Server) login(c *gin.Context) {
 	if previous, err := c.Cookie(sessionCookieName); err == nil && previous != "" {
 		s.mu.Lock()
 		delete(s.sessions, previous)
+		s.signalSessionsChangedLocked()
 		s.mu.Unlock()
 	}
-	sessionID, err := randomToken()
+	current, err := s.establishSession(c, authenticatedUsername)
 	if err != nil {
 		s.logger.Error("failed to create web session", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "暂时无法登录"})
 		return
 	}
-	csrfToken, err := randomToken()
-	if err != nil {
-		s.logger.Error("failed to create CSRF token", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "暂时无法登录"})
-		return
-	}
-	now := s.now()
-	current := session{Username: s.username, CSRFToken: csrfToken, ExpiresAt: now.Add(s.sessionTTL)}
 	s.mu.Lock()
-	s.sessions[sessionID] = current
 	delete(s.failures, clientIP)
-	s.purgeExpiredSessionsLocked(now)
 	s.mu.Unlock()
-	s.setSessionCookie(c, sessionID, int(s.sessionTTL.Seconds()))
 	c.JSON(http.StatusOK, makeSessionResponse(current))
 }
 
@@ -266,6 +311,7 @@ func (s *Server) logout(c *gin.Context) {
 	sessionID, _ := c.Get("session_id")
 	s.mu.Lock()
 	delete(s.sessions, sessionID.(string))
+	s.signalSessionsChangedLocked()
 	s.mu.Unlock()
 	s.setSessionCookie(c, "", -1)
 	c.JSON(http.StatusOK, gin.H{"logged_out": true})
@@ -401,6 +447,51 @@ func (s *Server) setSessionCookie(c *gin.Context, value string, maxAge int) {
 		Secure:   s.cookieSecure,
 		SameSite: http.SameSiteStrictMode,
 	})
+}
+
+func (s *Server) establishSession(c *gin.Context, username string) (session, error) {
+	sessionID, err := randomToken()
+	if err != nil {
+		return session{}, err
+	}
+	csrfToken, err := randomToken()
+	if err != nil {
+		return session{}, err
+	}
+	now := s.now()
+	current := session{Username: username, CSRFToken: csrfToken, ExpiresAt: now.Add(s.sessionTTL)}
+	s.mu.Lock()
+	s.sessions[sessionID] = current
+	s.purgeExpiredSessionsLocked(now)
+	s.signalSessionsChangedLocked()
+	s.mu.Unlock()
+	s.setSessionCookie(c, sessionID, int(s.sessionTTL.Seconds()))
+	return current, nil
+}
+
+func (s *Server) revokeSessions() {
+	s.mu.Lock()
+	s.sessions = make(map[string]session)
+	s.signalSessionsChangedLocked()
+	s.mu.Unlock()
+}
+
+func (s *Server) signalSessionsChangedLocked() {
+	close(s.sessionsChanged)
+	s.sessionsChanged = make(chan struct{})
+}
+
+func (s *Server) sessionChanges() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessionsChanged
+}
+
+func (s *Server) sessionExists(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.sessions[id]
+	return ok && current.ExpiresAt.After(s.now())
 }
 
 func makeSessionResponse(current session) sessionResponse {

@@ -2,9 +2,11 @@ export type QueueState = "idle" | "running" | "succeeded" | "stopped"
 export type KeepaliveState = "requesting" | "waiting_queue" | "waiting_next" | "stopped"
 
 export interface Target {
+  id: number
   name: string
   model: string
   api_host: string
+  busy: boolean
   queue: {
     state: QueueState
     attempts: number
@@ -41,6 +43,9 @@ export interface Activity {
 export interface Dashboard {
   version: string
   generated_at: string
+  config_revision: number
+  restart_required: boolean
+  restart_fields: string[]
   openilink: { state: string; error?: string; updated_at: string | null }
   concurrency: { current: number; max: number }
   targets: Target[]
@@ -53,6 +58,63 @@ export interface ActionResult {
   unknown: string[]
 }
 
+export interface ConfigurationTarget {
+  id: number
+  sort_order: number
+  name: string
+  api_base_url: string
+  api_key_set: boolean
+  model: string
+  wire_api: string
+  config_overrides: string[]
+  busy: boolean
+}
+
+export interface Configuration {
+  revision: number
+  loaded_startup_revision: number
+  restart_required: boolean
+  restart_fields: string[]
+  codex: {
+    binary: string
+    prompts_file: string
+    request_timeout_seconds: number
+    retry_min_seconds: number
+    retry_max_seconds: number
+    keepalive_min_seconds: number
+    keepalive_max_seconds: number
+    max_parallel: number
+    success_message: string
+    reasoning_effort: string
+    config_overrides: string[]
+  }
+  openilink: {
+    enabled: boolean
+    base_url: string
+    token_set: boolean
+    allowed_user_ids: string[]
+    http_timeout_seconds: number
+  }
+  web: {
+    listen_address: string
+    cookie_secure: boolean
+    trusted_proxies: string[]
+    activity_limit: number
+  }
+  account: { username: string }
+  targets: ConfigurationTarget[]
+}
+
+export interface TargetInput {
+  sort_order?: number
+  name: string
+  api_base_url: string
+  api_key: string
+  model: string
+  wire_api: string
+  config_overrides: string[]
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { credentials: "same-origin", ...init })
   const body = await response.json().catch(() => ({}))
@@ -60,11 +122,31 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return body as T
 }
 
-export async function session() {
+function jsonRequest<T>(url: string, csrf: string, method: string, body: unknown) {
+  return request<T>(url, {
+    method,
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+    body: JSON.stringify(body),
+  })
+}
+
+export function setupStatus() {
+  return request<{ required: boolean; suggested_username: string }>("/api/v1/setup/status")
+}
+
+export function setup(username: string, password: string) {
+  return request<{ authenticated: boolean; username: string; csrf_token: string; expires_at: string }>("/api/v1/setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  })
+}
+
+export function session() {
   return request<{ authenticated: boolean; username: string; csrf_token: string; expires_at: string }>("/api/v1/auth/session")
 }
 
-export async function login(username: string, password: string) {
+export function login(username: string, password: string) {
   return request<{ authenticated: boolean; username: string; csrf_token: string; expires_at: string }>("/api/v1/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -72,18 +154,46 @@ export async function login(username: string, password: string) {
   })
 }
 
-export async function logout(csrf: string) {
-  return request<{ logged_out: boolean }>("/api/v1/auth/logout", { method: "POST", headers: { ["X-CSRF-Token"]: csrf } })
+export function logout(csrf: string) {
+  return request<{ logged_out: boolean }>("/api/v1/auth/logout", { method: "POST", headers: { "X-CSRF-Token": csrf } })
 }
 
-export async function dashboard() {
+export function dashboard() {
   return request<Dashboard>("/api/v1/dashboard")
 }
 
-export async function action(csrf: string, name: string, targets: string[]) {
-  return request<ActionResult>("/api/v1/actions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ["X-CSRF-Token"]: csrf },
-    body: JSON.stringify({ action: name, targets }),
-  })
+export function action(csrf: string, name: string, targets: string[]) {
+  return jsonRequest<ActionResult>("/api/v1/actions", csrf, "POST", { action: name, targets })
+}
+
+export function getConfiguration() {
+  return request<Configuration>("/api/v1/config")
+}
+
+export function updateCodex(csrf: string, value: Configuration["codex"]) {
+  return jsonRequest<Configuration>("/api/v1/config/codex", csrf, "PUT", value)
+}
+
+export function updateOpenILink(csrf: string, value: Omit<Configuration["openilink"], "token_set"> & { token: string; clear_token: boolean }) {
+  return jsonRequest<Configuration>("/api/v1/config/openilink", csrf, "PUT", value)
+}
+
+export function updateWeb(csrf: string, value: Configuration["web"]) {
+  return jsonRequest<Configuration>("/api/v1/config/web", csrf, "PUT", value)
+}
+
+export function updateAccount(csrf: string, value: { username: string; current_password: string; new_password: string }) {
+  return jsonRequest<{ reauthentication_required: boolean; revision: number }>("/api/v1/account", csrf, "PUT", value)
+}
+
+export function createTarget(csrf: string, value: TargetInput) {
+  return jsonRequest<Configuration>("/api/v1/targets", csrf, "POST", value)
+}
+
+export function updateTarget(csrf: string, id: number, value: TargetInput) {
+  return jsonRequest<Configuration>(`/api/v1/targets/${id}`, csrf, "PUT", value)
+}
+
+export function deleteTarget(csrf: string, id: number) {
+  return request<Configuration>(`/api/v1/targets/${id}`, { method: "DELETE", headers: { "X-CSRF-Token": csrf } })
 }

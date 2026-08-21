@@ -592,3 +592,85 @@ func TestBeginShutdownCancelsRunsAndWaitsForCleanup(t *testing.T) {
 		t.Fatalf("start after shutdown = %+v", result)
 	}
 }
+
+func TestIntervalUpdatesResampleWaitingQueueAndKeepaliveFromSaveTime(t *testing.T) {
+	t.Run("queue retry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runner := &immediateSequenceRunner{
+			results: []codex.Result{{Error: "queued"}, {Success: true, Response: "ok"}},
+			calls:   make(chan observedCall, 4),
+		}
+		target := config.Target{ID: 1, Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+		manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
+		manager.Start(nil, Subscriber{})
+		receiveObservedCall(t, runner.calls)
+		waitForCondition(t, func() bool {
+			snapshots, _ := manager.Snapshots(nil)
+			return !snapshots[0].NextAttempt.IsZero()
+		})
+		savedAt := time.Now()
+		manager.UpdateSettings(20*time.Millisecond, 30*time.Millisecond, time.Hour, time.Hour, 1, "ok", 200)
+		second := receiveObservedCall(t, runner.calls)
+		if delay := second.at.Sub(savedAt); delay < 15*time.Millisecond || delay > 200*time.Millisecond {
+			t.Fatalf("resampled retry delay = %s", delay)
+		}
+	})
+
+	t.Run("keepalive", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runner := &immediateSequenceRunner{results: []codex.Result{{Success: true}, {Success: true}}, calls: make(chan observedCall, 4)}
+		target := config.Target{ID: 1, Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+		manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
+		manager.StartKeepalive(nil)
+		receiveObservedCall(t, runner.calls)
+		waitForCondition(t, func() bool {
+			snapshots, _ := manager.KeepaliveSnapshots(nil)
+			return !snapshots[0].NextRequest.IsZero()
+		})
+		savedAt := time.Now()
+		manager.UpdateSettings(time.Hour, time.Hour, 20*time.Millisecond, 30*time.Millisecond, 1, "ok", 200)
+		second := receiveObservedCall(t, runner.calls)
+		if delay := second.at.Sub(savedAt); delay < 15*time.Millisecond || delay > 200*time.Millisecond {
+			t.Fatalf("resampled keepalive delay = %s", delay)
+		}
+		manager.StopKeepalive(nil)
+	})
+}
+
+func TestDynamicConcurrencyDecreaseAndIncreaseDoNotCancelRunningProcesses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	targets := []config.Target{
+		{ID: 1, Name: "one", APIBaseURL: "https://one.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"},
+		{ID: 2, Name: "two", APIBaseURL: "https://two.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"},
+		{ID: 3, Name: "three", APIBaseURL: "https://three.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"},
+	}
+	manager := New(ctx, targets, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 2, "ok")
+	manager.Start(nil, Subscriber{})
+	first := receiveControlledCall(t, runner)
+	second := receiveControlledCall(t, runner)
+	manager.UpdateSettings(time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok", 200)
+	first.result <- codex.Result{Success: true, Response: "ok"}
+	assertNoControlledCall(t, runner, 30*time.Millisecond)
+	select {
+	case <-second.done:
+		t.Fatal("decreasing max_parallel cancelled an existing process")
+	default:
+	}
+	second.result <- codex.Result{Success: true, Response: "ok"}
+	third := receiveControlledCall(t, runner)
+
+	manager.CreateTarget(&config.Target{ID: 4, SortOrder: 4, Name: "four", APIBaseURL: "https://four.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}, nil)
+	manager.Start([]string{"four"}, Subscriber{})
+	assertNoControlledCall(t, runner, 20*time.Millisecond)
+	manager.UpdateSettings(time.Hour, time.Hour, time.Hour, time.Hour, 2, "ok", 200)
+	fourth := receiveControlledCall(t, runner)
+	if third.target == fourth.target {
+		t.Fatalf("raising max_parallel did not release a different waiting target: %s", third.target)
+	}
+	third.result <- codex.Result{Success: true, Response: "ok"}
+	fourth.result <- codex.Result{Success: true, Response: "ok"}
+}

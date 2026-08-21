@@ -171,3 +171,67 @@ func TestTailBufferKeepsOnlyTheNewestBytes(t *testing.T) {
 		t.Fatalf("buffer after large write = %q", got)
 	}
 }
+
+func TestRunnerRuntimeSettingsAreSnapshottedPerRequest(t *testing.T) {
+	dir := t.TempDir()
+	prompts := filepath.Join(dir, "prompts.txt")
+	if err := os.WriteFile(prompts, []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "snapshot-codex")
+	body := `#!/bin/sh
+set -eu
+script_dir=${0%/*}
+count=0
+if [ -f "$script_dir/count" ]; then count=$(cat "$script_dir/count"); fi
+count=$((count + 1))
+printf '%s' "$count" > "$script_dir/count"
+printf '%s\n' "$@" > "$script_dir/args-$count"
+if [ "$count" = "1" ]; then
+  : > "$script_dir/started"
+  while [ ! -f "$script_dir/release" ]; do sleep 0.01; done
+fi
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--output-last-message" ]; then out="$arg"; fi
+  previous="$arg"
+done
+printf 'ok' > "$out"
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Binary: script, PromptsFile: prompts, Timeout: time.Second, ReasoningEffort: "low", Overrides: []string{`feature_flag="old"`}}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	firstResult := make(chan Result, 1)
+	go func() { firstResult <- runner.Run(context.Background(), target, 1) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "started")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first request did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	runner.UpdateRuntime(2*time.Second, "high", []string{`feature_flag="new"`})
+	if err := os.WriteFile(filepath.Join(dir, "release"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if result := <-firstResult; !result.Success {
+		t.Fatalf("first result = %+v", result)
+	}
+	if result := runner.Run(context.Background(), target, 2); !result.Success {
+		t.Fatalf("second result = %+v", result)
+	}
+	firstArgs, _ := os.ReadFile(filepath.Join(dir, "args-1"))
+	secondArgs, _ := os.ReadFile(filepath.Join(dir, "args-2"))
+	if !strings.Contains(string(firstArgs), `model_reasoning_effort="low"`) || !strings.Contains(string(firstArgs), `feature_flag="old"`) || strings.Contains(string(firstArgs), `feature_flag="new"`) {
+		t.Fatalf("first request settings = %s", firstArgs)
+	}
+	if !strings.Contains(string(secondArgs), `model_reasoning_effort="high"`) || !strings.Contains(string(secondArgs), `feature_flag="new"`) {
+		t.Fatalf("second request settings = %s", secondArgs)
+	}
+}

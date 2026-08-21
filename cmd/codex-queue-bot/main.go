@@ -16,10 +16,10 @@ import (
 
 	"codex-queue-bot/internal/codex"
 	"codex-queue-bot/internal/commands"
-	"codex-queue-bot/internal/config"
 	"codex-queue-bot/internal/hub"
 	"codex-queue-bot/internal/jobs"
 	"codex-queue-bot/internal/proxyenv"
+	"codex-queue-bot/internal/storage"
 	"codex-queue-bot/internal/web"
 )
 
@@ -31,6 +31,11 @@ func main() {
 		configDefault = "config.json"
 	}
 	configPath := flag.String("config", configDefault, "path to JSON configuration")
+	dbDefault := os.Getenv("CODEX_QUEUE_DB_PATH")
+	if dbDefault == "" {
+		dbDefault = "data/codex-queue-bot.db"
+	}
+	dbPath := flag.String("db", dbDefault, "path to SQLite configuration database")
 	checkOnly := flag.Bool("check", false, "validate configuration, Codex executable, and prompts, then exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -52,16 +57,22 @@ func main() {
 			"no_proxy", proxyConfig.NoProxy != "",
 		)
 	}
-	cfg, err := config.Load(*configPath)
+	configStore, err := storage.Open(context.Background(), storage.Options{
+		Path:             *dbPath,
+		MasterKeyBase64:  os.Getenv("CODEX_QUEUE_MASTER_KEY"),
+		LegacyConfigPath: *configPath,
+	})
 	if err != nil {
-		logger.Error("configuration error", "error", err)
+		logger.Error("configuration database error", "error", err)
 		os.Exit(2)
 	}
-	adminPassword, err := cfg.AdminPassword()
+	defer configStore.Close()
+	snapshot, err := configStore.Load(context.Background())
 	if err != nil {
-		logger.Error("web administrator configuration error", "error", err)
+		logger.Error("load configuration database", "error", err)
 		os.Exit(2)
 	}
+	cfg := &snapshot.Config
 
 	runner := &codex.Runner{
 		Binary:          cfg.Codex.Binary,
@@ -71,14 +82,23 @@ func main() {
 		Overrides:       cfg.Codex.ConfigOverrides,
 		Logger:          logger,
 	}
-	if err := runner.Check(); err != nil {
-		logger.Error("Codex preflight failed", "error", err)
-		os.Exit(2)
+	if len(cfg.Codex.Targets) > 0 || *checkOnly {
+		if err := runner.Check(); err != nil {
+			logger.Error("Codex preflight failed", "error", err)
+			os.Exit(2)
+		}
+	} else {
+		logger.Info("skipping Codex preflight because no targets are configured")
 	}
 	if *checkOnly {
-		fmt.Printf("configuration OK: %d target(s), Codex=%s, prompts=%s\n", len(cfg.Codex.Targets), cfg.Codex.Binary, cfg.Codex.PromptsFile)
+		fmt.Printf("configuration OK: revision=%d, setup_required=%t, %d target(s), Codex=%s, prompts=%s\n", snapshot.Revision, snapshot.SetupRequired, len(cfg.Codex.Targets), cfg.Codex.Binary, cfg.Codex.PromptsFile)
 		return
 	}
+	if err := configStore.MarkStartupLoaded(context.Background(), snapshot.Revision); err != nil {
+		logger.Error("record startup configuration revision", "error", err)
+		os.Exit(2)
+	}
+	snapshot.LoadedStartupRevision = snapshot.Revision
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -109,13 +129,14 @@ func main() {
 	webServer, err := web.New(web.Options{
 		Manager:         manager,
 		OpenILinkStatus: statusStore,
-		Username:        cfg.Web.AdminUsername,
-		Password:        adminPassword,
 		CookieSecure:    cfg.Web.CookieSecure,
 		TrustedProxies:  cfg.Web.TrustedProxies,
 		Version:         version,
 		Logger:          logger,
 		Shutdown:        ctx.Done(),
+		ConfigStore:     configStore,
+		InitialConfig:   snapshot,
+		Runner:          runner,
 	})
 	if err != nil {
 		logger.Error("web server configuration error", "error", err)

@@ -14,6 +14,8 @@ import (
 func (s *Server) events(c *gin.Context) {
 	currentValue, _ := c.Get("session")
 	current := currentValue.(session)
+	sessionIDValue, _ := c.Get("session_id")
+	sessionID := sessionIDValue.(string)
 	initialState, initialActivities, managerSubscription := s.manager.Observe(s.observerBuffer)
 	defer managerSubscription.Close()
 	initialStatus, statusSubscription := s.status.Observe(8)
@@ -37,6 +39,8 @@ func (s *Server) events(c *gin.Context) {
 	}
 	expires := time.NewTimer(expiresIn)
 	defer expires.Stop()
+	configurationChanges := s.configurationChanges()
+	sessionChanges := s.sessionChanges()
 
 	for {
 		select {
@@ -67,6 +71,17 @@ func (s *Server) events(c *gin.Context) {
 				return
 			}
 			if !s.writeSSE(c, "state", "", s.statePayload(s.manager.ComprehensiveSnapshot(), status)) {
+				return
+			}
+		case <-configurationChanges:
+			configurationChanges = s.configurationChanges()
+			if !s.writeSSE(c, "state", "", s.statePayload(s.manager.ComprehensiveSnapshot(), s.status.Snapshot())) {
+				return
+			}
+		case <-sessionChanges:
+			sessionChanges = s.sessionChanges()
+			if !s.sessionExists(sessionID) {
+				_ = s.writeSSE(c, "auth_expired", "", map[string]any{"at": s.now()})
 				return
 			}
 		case at := <-heartbeat.C:

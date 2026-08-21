@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -116,6 +118,8 @@ type CodexConfig struct {
 }
 
 type Target struct {
+	ID              int64    `json:"id,omitempty"`
+	SortOrder       int      `json:"sort_order,omitempty"`
 	Name            string   `json:"name"`
 	APIBaseURL      string   `json:"api_base_url"`
 	APIKey          string   `json:"api_key,omitempty"`
@@ -253,6 +257,17 @@ func (c *Config) resolveSecrets() error {
 }
 
 func (c *Config) Validate() error {
+	return c.validate(false)
+}
+
+// ValidateAllowEmptyTargets validates a database-backed configuration. A new
+// installation intentionally starts without targets so the administrator can
+// add them from the setup UI.
+func (c *Config) ValidateAllowEmptyTargets() error {
+	return c.validate(true)
+}
+
+func (c *Config) validate(allowEmptyTargets bool) error {
 	if c.OpenILink.IsOpenILinkEnabled() {
 		if err := validateHTTPURL("openilink.base_url", c.OpenILink.BaseURL); err != nil {
 			return err
@@ -285,7 +300,7 @@ func (c *Config) Validate() error {
 	if c.Codex.MaxParallel <= 0 {
 		return errors.New("codex.max_parallel must be positive")
 	}
-	if len(c.Codex.Targets) == 0 {
+	if !allowEmptyTargets && len(c.Codex.Targets) == 0 {
 		return errors.New("at least one codex target is required")
 	}
 	if c.Web.ActivityLimit < 0 {
@@ -333,6 +348,128 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// DefaultDatabaseConfig returns the defaults for a fresh SQLite installation.
+// Unlike the legacy JSON defaults, cookies default to non-secure so a local
+// first-run setup page works without TLS.
+func DefaultDatabaseConfig() Config {
+	return Config{
+		OpenILink: OpenILinkConfig{
+			Enabled:           false,
+			BaseURL:           defaultHubBaseURL,
+			HTTPTimeoutSecond: defaultHTTPTimeout,
+			enabledSet:        true,
+		},
+		Codex: CodexConfig{
+			Binary:               defaultCodexBinary,
+			PromptsFile:          defaultPromptsFile,
+			RequestTimeoutSecond: defaultRequestTimeout,
+			RetryMinSecond:       defaultRetryMin,
+			RetryMaxSecond:       defaultRetryMax,
+			KeepaliveMinSecond:   defaultKeepaliveMin,
+			KeepaliveMaxSecond:   defaultKeepaliveMax,
+			MaxParallel:          defaultMaxParallel,
+			SuccessMessage:       defaultSuccessMessage,
+			ReasoningEffort:      defaultReasoningEffort,
+			ConfigOverrides:      []string{},
+			Targets:              []Target{},
+		},
+		Web: WebConfig{
+			ListenAddress:   defaultWebListenAddress,
+			AdminUsername:   defaultWebAdminUsername,
+			CookieSecure:    false,
+			TrustedProxies:  []string{},
+			ActivityLimit:   defaultWebActivityLimit,
+			cookieSecureSet: true,
+		},
+	}
+}
+
+// ValidateTarget validates one normalized target. It is used by the SQLite
+// CRUD layer without requiring a non-empty full target list.
+func ValidateTarget(target Target) error {
+	if target.SortOrder < 0 {
+		return errors.New("target sort_order must not be negative")
+	}
+	cfg := DefaultDatabaseConfig()
+	cfg.Codex.Targets = []Target{target}
+	return cfg.ValidateAllowEmptyTargets()
+}
+
+// ValidateCodex validates the task section while allowing an empty target
+// list. Targets supplied on the section are validated too.
+func ValidateCodex(codexConfig CodexConfig) error {
+	if strings.TrimSpace(codexConfig.PromptsFile) == "" {
+		return errors.New("codex.prompts_file is required")
+	}
+	if strings.TrimSpace(codexConfig.SuccessMessage) == "" {
+		return errors.New("codex.success_message is required")
+	}
+	if strings.TrimSpace(codexConfig.ReasoningEffort) == "" {
+		return errors.New("codex.reasoning_effort is required")
+	}
+	switch strings.ToLower(strings.TrimSpace(codexConfig.ReasoningEffort)) {
+	case "low", "medium", "high", "xhigh":
+	default:
+		return errors.New("codex.reasoning_effort must be low, medium, high, or xhigh")
+	}
+	cfg := DefaultDatabaseConfig()
+	cfg.Codex = codexConfig
+	return cfg.ValidateAllowEmptyTargets()
+}
+
+// ValidateOpenILink validates the connection section with its resolved token.
+func ValidateOpenILink(openILink OpenILinkConfig) error {
+	if err := validateHTTPURL("openilink.base_url", strings.TrimRight(strings.TrimSpace(openILink.BaseURL), "/")); err != nil {
+		return err
+	}
+	if openILink.HTTPTimeoutSecond <= 0 {
+		return errors.New("openilink.http_timeout_seconds must be positive")
+	}
+	openILink.enabledSet = true
+	cfg := DefaultDatabaseConfig()
+	cfg.OpenILink = openILink
+	return cfg.ValidateAllowEmptyTargets()
+}
+
+// ValidateWeb validates the Web section independently.
+func ValidateWeb(web WebConfig) error {
+	if strings.TrimSpace(web.ListenAddress) == "" {
+		return errors.New("web.listen_address is required")
+	}
+	if err := validateListenAddress(web.ListenAddress); err != nil {
+		return err
+	}
+	for index, proxy := range web.TrustedProxies {
+		proxy = strings.TrimSpace(proxy)
+		if proxy == "*" || net.ParseIP(proxy) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(proxy); err != nil {
+			return fmt.Errorf("web.trusted_proxies[%d] must be an IP address or CIDR", index)
+		}
+	}
+	cfg := DefaultDatabaseConfig()
+	cfg.Web = web
+	return cfg.ValidateAllowEmptyTargets()
+}
+
+// NormalizeTarget applies the same normalization used by the legacy loader.
+func NormalizeTarget(target Target) Target {
+	target.Name = strings.TrimSpace(target.Name)
+	target.APIBaseURL = strings.TrimRight(strings.TrimSpace(target.APIBaseURL), "/")
+	target.APIKey = strings.TrimSpace(target.APIKey)
+	target.APIKeyEnv = strings.TrimSpace(target.APIKeyEnv)
+	target.Model = strings.TrimSpace(target.Model)
+	target.WireAPI = strings.ToLower(strings.TrimSpace(target.WireAPI))
+	if target.WireAPI == "" {
+		target.WireAPI = defaultWireAPI
+	}
+	for i := range target.ConfigOverrides {
+		target.ConfigOverrides[i] = strings.TrimSpace(target.ConfigOverrides[i])
+	}
+	return target
+}
+
 // IsOpenILinkEnabled implements the backwards-compatible default described in
 // the configuration contract.
 func (c OpenILinkConfig) IsOpenILinkEnabled() bool {
@@ -343,6 +480,13 @@ func (c OpenILinkConfig) IsOpenILinkEnabled() bool {
 }
 
 func (c *Config) OpenILinkEnabled() bool { return c.OpenILink.IsOpenILinkEnabled() }
+
+// SetEnabledExplicit preserves an explicit false when configuration is loaded
+// from SQLite rather than decoded from legacy JSON.
+func (c *OpenILinkConfig) SetEnabledExplicit(value bool) {
+	c.Enabled = value
+	c.enabledSet = true
+}
 
 // AdminPassword reads the administrator password from the configured
 // environment variable. It intentionally does not retain or log the value.
@@ -395,6 +539,22 @@ func validateHTTPURL(label, raw string) error {
 	}
 	if u.RawQuery != "" {
 		return fmt.Errorf("%s must not contain a URL query", label)
+	}
+	return nil
+}
+
+func validateListenAddress(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return errors.New("web.listen_address is required")
+	}
+	_, port, err := net.SplitHostPort(raw)
+	if err != nil {
+		return errors.New("web.listen_address must be host:port")
+	}
+	parsed, err := strconv.Atoi(port)
+	if err != nil || parsed < 0 || parsed > 65535 {
+		return errors.New("web.listen_address port must be between 0 and 65535")
 	}
 	return nil
 }
