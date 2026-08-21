@@ -556,6 +556,37 @@ func TestWebStartDoesNotNotifyButLaterOpenILinkSubscriptionDoes(t *testing.T) {
 	}
 }
 
+func TestSubscribersCanUseDifferentMessengers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	openILinkMessenger := &channelMessenger{messages: make(chan sentMessage, 1)}
+	telegramMessenger := &channelMessenger{messages: make(chan sentMessage, 1)}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬")
+
+	manager.StartWithOperation(nil, Subscriber{Recipient: "open-user", Key: "openilink:open-user", Messenger: openILinkMessenger}, Operation{Source: SourceOpenILink, Actor: "open-user"})
+	call := receiveControlledCall(t, runner)
+	manager.StartWithOperation(nil, Subscriber{Recipient: "telegram-chat", Key: "telegram:telegram-chat", Messenger: telegramMessenger}, Operation{Source: SourceTelegram, Actor: "telegram-user"})
+	call.result <- codex.Result{Success: true, Response: "ok"}
+	select {
+	case message := <-openILinkMessenger.messages:
+		if message.to != "open-user" {
+			t.Fatalf("OpenILink notification = %+v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OpenILink notification timed out")
+	}
+	select {
+	case message := <-telegramMessenger.messages:
+		if message.to != "telegram-chat" {
+			t.Fatalf("Telegram notification = %+v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Telegram notification timed out")
+	}
+}
+
 func TestTargetErrorsAreSanitizedBeforeSnapshotsAndActivities(t *testing.T) {
 	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1/private", APIKey: "secret-key", APIKeyEnv: "SECRET_KEY_ENV", Model: "m", WireAPI: "responses"}
 	value := sanitizeTargetError(target, "request https://api.example/v1/private/responses with secret-key from SECRET_KEY_ENV failed")

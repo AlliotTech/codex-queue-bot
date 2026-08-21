@@ -15,9 +15,11 @@ func TestLoadAppliesDefaultsAndResolvesSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("TEST_HUB_TOKEN", "hub-secret")
+	t.Setenv("TEST_TELEGRAM_TOKEN", "telegram-secret")
 	t.Setenv("TEST_CODEX_KEY", "codex-secret")
 	data := `{
   "openilink": {"base_url": "https://hub.example.com/", "token_env": "TEST_HUB_TOKEN"},
+  "telegram": {"base_url": "https://api.telegram.org/", "token_env": "TEST_TELEGRAM_TOKEN"},
   "codex": {
     "targets": [
       {"name": "main", "api_base_url": "https://api.example.com/v1/", "api_key_env": "TEST_CODEX_KEY", "model": "gpt-test"}
@@ -34,6 +36,12 @@ func TestLoadAppliesDefaultsAndResolvesSecrets(t *testing.T) {
 	}
 	if cfg.OpenILink.Token != "hub-secret" {
 		t.Fatalf("OpenILink token = %q", cfg.OpenILink.Token)
+	}
+	if cfg.Telegram.Token != "telegram-secret" || !cfg.TelegramEnabled() {
+		t.Fatalf("Telegram config = %+v", cfg.Telegram)
+	}
+	if cfg.Telegram.BaseURL != "https://api.telegram.org" || cfg.Telegram.HTTPTimeoutSecond != defaultTelegramHTTP || cfg.Telegram.PollTimeoutSecond != defaultTelegramPoll {
+		t.Fatalf("Telegram defaults = %+v", cfg.Telegram)
 	}
 	if cfg.Codex.Targets[0].APIKey != "codex-secret" {
 		t.Fatalf("Codex key = %q", cfg.Codex.Targets[0].APIKey)
@@ -103,6 +111,23 @@ func TestExplicitlyEnabledOpenILinkStillRequiresToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "openilink token is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExplicitlyEnabledTelegramStillRequiresToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("TEST_CODEX_KEY", "codex-secret")
+	data := `{
+  "openilink": {"enabled": false},
+  "telegram": {"enabled": true},
+  "codex": {"targets": [{"name":"main","api_base_url":"https://api.example/v1","api_key_env":"TEST_CODEX_KEY","model":"gpt-test"}]}
+}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "telegram token is required") {
 		t.Fatalf("error = %v", err)
 	}
 }

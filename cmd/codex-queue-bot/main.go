@@ -20,6 +20,7 @@ import (
 	"codex-queue-bot/internal/jobs"
 	"codex-queue-bot/internal/proxyenv"
 	"codex-queue-bot/internal/storage"
+	"codex-queue-bot/internal/telegram"
 	"codex-queue-bot/internal/web"
 )
 
@@ -104,18 +105,22 @@ func main() {
 	defer stop()
 
 	statusStore := hub.NewStatusStore(hub.StatusDisabled)
+	telegramStatusStore := hub.NewStatusStore(hub.StatusDisabled)
 	var hubClient *hub.Client
-	var messenger jobs.Messenger
 	if cfg.OpenILinkEnabled() {
 		hubClient = hub.New(cfg.OpenILink.BaseURL, cfg.OpenILink.Token, cfg.HTTPTimeout(), logger)
 		statusStore = hubClient.StatusStore()
-		messenger = hubClient
+	}
+	var telegramClient *telegram.Client
+	if cfg.TelegramEnabled() {
+		telegramClient = telegram.New(cfg.Telegram.BaseURL, cfg.Telegram.Token, cfg.TelegramHTTPTimeout(), cfg.TelegramPollTimeout(), logger)
+		telegramStatusStore = telegramClient.StatusStore()
 	}
 	manager := jobs.New(
 		ctx,
 		cfg.Codex.Targets,
 		runner,
-		messenger,
+		nil,
 		logger,
 		cfg.RetryMin(),
 		cfg.RetryMax(),
@@ -129,6 +134,7 @@ func main() {
 	webServer, err := web.New(web.Options{
 		Manager:         manager,
 		OpenILinkStatus: statusStore,
+		TelegramStatus:  telegramStatusStore,
 		CookieSecure:    cfg.Web.CookieSecure,
 		TrustedProxies:  cfg.Web.TrustedProxies,
 		Version:         version,
@@ -169,12 +175,25 @@ func main() {
 			}
 		}()
 	}
+	if telegramClient != nil {
+		handler := commands.NewAdapter(manager, telegramClient, logger, cfg.Telegram.AllowedUserIDs, jobs.SourceTelegram, "Telegram")
+		go func() {
+			if err := telegramClient.Run(ctx, handler.Handle); err != nil {
+				if errors.Is(err, telegram.ErrUnauthorized) {
+					logger.Error("Telegram authentication failed; Web console remains available", "error", err)
+				} else if ctx.Err() == nil {
+					logger.Error("Telegram listener stopped; Web console remains available", "error", err)
+				}
+			}
+		}()
+	}
 
 	logger.Info(
 		"Codex Web console started",
 		"version", version,
 		"listen_address", cfg.Web.ListenAddress,
 		"openilink_enabled", cfg.OpenILinkEnabled(),
+		"telegram_enabled", cfg.TelegramEnabled(),
 		"targets", strings.Join(manager.TargetNames(), ","),
 		"max_parallel", cfg.Codex.MaxParallel,
 		"keepalive_min", cfg.KeepaliveMin(),

@@ -1,6 +1,6 @@
 # Codex Queue Bot
 
-Codex API 排队与保活服务，提供 Gin + React 管理控制台。多个 target 共用同一个任务队列、并发上限和运行状态；OpenILink 是可选的消息入口。
+Codex API 排队与保活服务，提供 Gin + React 管理控制台。多个 target 共用同一个任务队列、可配置并发上限和运行状态；OpenILink 与 Telegram Bot 都可作为消息入口，并可同时启用。
 
 ## 快速部署
 
@@ -32,13 +32,13 @@ docker compose config
 
 ## 配置与数据
 
-SQLite 是运行时的唯一配置源。登录控制台后可以维护 target、Codex 参数、OpenILink 和 Web 设置；密钥写入数据库前会加密，API 不会返回原文。
+SQLite 是运行时的唯一配置源。登录控制台后可以维护 target、Codex 参数、OpenILink、Telegram 和 Web 设置；密钥写入数据库前会加密，API 不会返回原文。
 
 必须设置：
 
 - `CODEX_QUEUE_MASTER_KEY`：Base64 编码的 32 字节随机值。首次生成后必须长期保存；丢失或更换会导致数据库密钥无法解密。
 
-可选环境变量见 [.env.example](.env.example)：镜像名、日志级别和出站代理。Codex API Key、OpenILink Token 通常在控制台配置，不需要写入 `.env`。
+可选环境变量见 [.env.example](.env.example)：镜像名、日志级别和出站代理。Codex API Key、OpenILink Token 和 Telegram Bot Token 通常在控制台配置，不需要写入 `.env`。
 
 常用启动参数：
 
@@ -55,7 +55,7 @@ SQLite 是运行时的唯一配置源。登录控制台后可以维护 target、
 
 ## 控制台与任务
 
-控制台展示 SSE 连接、OpenILink 状态、并发概览、每个 target 的排队/保活状态和近期活动，并支持单个或批量启动、停止任务。配置页会标记需要重启才能生效的字段。
+控制台展示 SSE、OpenILink、Telegram 状态、并发概览、每个 target 的排队/保活状态和近期活动，并支持单个或批量启动、停止任务。最大并发可在“任务与保活”中修改并立即生效；降低并发不会中断已经运行的请求。配置页会标记需要重启才能生效的字段。
 
 任务规则：
 
@@ -63,9 +63,11 @@ SQLite 是运行时的唯一配置源。登录控制台后可以维护 target、
 - 保活启动后立即请求，之后在随机区间内继续请求；失败只记录状态。
 - 同一 target 不会同时执行排队和保活；排队优先。
 
-## OpenILink（可选）
+## 消息入口（可选）
 
-OpenILink 默认关闭。可在控制台配置并启用；连接失败或鉴权失败不会影响 Web 控制台。原有中英文命令继续可用：
+OpenILink 和 Telegram 默认关闭，可在控制台分别配置并启用；任一入口连接失败或鉴权失败都不会影响 Web 控制台。Telegram 使用 Bot API 长轮询，无需公网 Webhook。建议填写允许的用户 ID；留空表示允许所有能联系机器人的用户执行命令。
+
+两个入口使用相同的中英文命令：
 
 | 中文 | 英文别名 | 作用 |
 |---|---|---|
@@ -79,6 +81,8 @@ OpenILink 默认关闭。可在控制台配置并启用；连接失败或鉴权�
 | `/帮助` | `/help` | 查看帮助 |
 
 多个 target 可用空格、逗号或分号分隔；`all`/`全部` 表示全部目标。
+
+Telegram 中无参数的 `/start` 用于显示帮助，避免首次打开机器人时意外启动全部任务；启动全部目标可使用 `/开挤`、`/go` 或 `/start all`。
 
 ## 本机开发
 

@@ -83,6 +83,14 @@ type persistedOpenILink struct {
 	HTTPTimeoutSecond int      `json:"http_timeout_seconds"`
 }
 
+type persistedTelegram struct {
+	Enabled           bool     `json:"enabled"`
+	BaseURL           string   `json:"base_url"`
+	AllowedUserIDs    []string `json:"allowed_user_ids"`
+	HTTPTimeoutSecond int      `json:"http_timeout_seconds"`
+	PollTimeoutSecond int      `json:"poll_timeout_seconds"`
+}
+
 type persistedWeb struct {
 	ListenAddress  string   `json:"listen_address"`
 	CookieSecure   bool     `json:"cookie_secure"`
@@ -129,6 +137,11 @@ CREATE TABLE targets (
   config_overrides TEXT NOT NULL
 );`},
 	{version: 2, sql: `CREATE INDEX targets_sort_order_idx ON targets(sort_order, id);`},
+	{version: 3, sql: `
+INSERT INTO config_sections(name, revision, data, secret)
+SELECT 'telegram', 1, '{"enabled":false,"base_url":"https://api.telegram.org","allowed_user_ids":[],"http_timeout_seconds":45,"poll_timeout_seconds":30}', NULL
+WHERE EXISTS (SELECT 1 FROM app_meta WHERE key = 'app_initialized')
+  AND NOT EXISTS (SELECT 1 FROM config_sections WHERE name = 'telegram');`},
 }
 
 func Open(ctx context.Context, options Options) (*Store, error) {
@@ -220,6 +233,13 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 					legacy.OpenILink.Token = strings.TrimSpace(os.Getenv(envName))
 					if legacy.OpenILink.Token == "" {
 						return cleanup(fmt.Errorf("import legacy configuration: openilink.token_env %q is not set", envName))
+					}
+				}
+				if legacy.Telegram.Token == "" && strings.TrimSpace(legacy.Telegram.TokenEnv) != "" {
+					envName := strings.TrimSpace(legacy.Telegram.TokenEnv)
+					legacy.Telegram.Token = strings.TrimSpace(os.Getenv(envName))
+					if legacy.Telegram.Token == "" {
+						return cleanup(fmt.Errorf("import legacy configuration: telegram.token_env %q is not set", envName))
 					}
 				}
 				cfg = *legacy
@@ -347,6 +367,9 @@ func (s *Store) initialize(ctx context.Context, cfg config.Config, suggestedUser
 	cfg.OpenILink.SetEnabledExplicit(cfg.OpenILinkEnabled())
 	cfg.OpenILink.Token = strings.TrimSpace(cfg.OpenILink.Token)
 	cfg.OpenILink.TokenEnv = ""
+	cfg.Telegram.SetEnabledExplicit(cfg.TelegramEnabled())
+	cfg.Telegram.Token = strings.TrimSpace(cfg.Telegram.Token)
+	cfg.Telegram.TokenEnv = ""
 	cfg.Web.AdminPasswordEnv = ""
 	for index := range cfg.Codex.Targets {
 		cfg.Codex.Targets[index] = config.NormalizeTarget(cfg.Codex.Targets[index])
@@ -364,6 +387,10 @@ func (s *Store) initialize(ctx context.Context, cfg config.Config, suggestedUser
 	if err != nil {
 		return err
 	}
+	telegramData, err := json.Marshal(toPersistedTelegram(cfg.Telegram))
+	if err != nil {
+		return err
+	}
 	webData, err := json.Marshal(toPersistedWeb(cfg.Web))
 	if err != nil {
 		return err
@@ -371,6 +398,13 @@ func (s *Store) initialize(ctx context.Context, cfg config.Config, suggestedUser
 	var tokenCipher []byte
 	if cfg.OpenILink.Token != "" {
 		tokenCipher, err = s.encrypt([]byte(cfg.OpenILink.Token), "openilink:token")
+		if err != nil {
+			return err
+		}
+	}
+	var telegramTokenCipher []byte
+	if cfg.Telegram.Token != "" {
+		telegramTokenCipher, err = s.encrypt([]byte(cfg.Telegram.Token), "telegram:token")
 		if err != nil {
 			return err
 		}
@@ -397,6 +431,7 @@ func (s *Store) initialize(ctx context.Context, cfg config.Config, suggestedUser
 	}{
 		{name: "codex", data: codexData},
 		{name: "openilink", data: openData, secret: tokenCipher},
+		{name: "telegram", data: telegramData, secret: telegramTokenCipher},
 		{name: "web", data: webData},
 	} {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO config_sections(name, revision, data, secret) VALUES (?, 1, ?, ?)`, section.name, string(section.data), nullableBytes(section.secret)); err != nil {
@@ -441,7 +476,7 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 }
 
 func (s *Store) loadFrom(ctx context.Context, q queryer) (Snapshot, error) {
-	result := Snapshot{SectionRevisions: make(map[string]int64, 3)}
+	result := Snapshot{SectionRevisions: make(map[string]int64, 4)}
 	var codexRecord persistedCodex
 	if revision, _, err := s.readSection(ctx, q, "codex", &codexRecord); err != nil {
 		return Snapshot{}, err
@@ -454,6 +489,12 @@ func (s *Store) loadFrom(ctx context.Context, q queryer) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	result.SectionRevisions["openilink"] = openRevision
+	var telegramRecord persistedTelegram
+	telegramRevision, telegramTokenCipher, err := s.readSection(ctx, q, "telegram", &telegramRecord)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	result.SectionRevisions["telegram"] = telegramRevision
 	var webRecord persistedWeb
 	if revision, _, err := s.readSection(ctx, q, "web", &webRecord); err != nil {
 		return Snapshot{}, err
@@ -470,6 +511,15 @@ func (s *Store) loadFrom(ctx context.Context, q queryer) (Snapshot, error) {
 			return Snapshot{}, fmt.Errorf("decrypt OpenILink token: %w", decryptErr)
 		}
 		result.Config.OpenILink.Token = string(plain)
+	}
+	result.Config.Telegram = fromPersistedTelegram(telegramRecord)
+	result.Config.Telegram.SetEnabledExplicit(telegramRecord.Enabled)
+	if len(telegramTokenCipher) > 0 {
+		plain, decryptErr := s.decrypt(telegramTokenCipher, "telegram:token")
+		if decryptErr != nil {
+			return Snapshot{}, fmt.Errorf("decrypt Telegram token: %w", decryptErr)
+		}
+		result.Config.Telegram.Token = string(plain)
 	}
 	result.Config.Web = fromPersistedWeb(webRecord)
 
@@ -745,6 +795,68 @@ func (s *Store) UpdateOpenILink(ctx context.Context, value config.OpenILinkConfi
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE config_sections SET revision = revision + 1, data = ?, secret = ? WHERE name = 'openilink'`, string(data), nullableBytes(cipherValue)); err != nil {
+		_ = tx.Rollback()
+		return Snapshot{}, err
+	}
+	if _, err := bumpRevisionTx(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return Snapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Snapshot{}, err
+	}
+	return s.loadAfterCommit(ctx)
+}
+
+// UpdateTelegram keeps the existing token when token is nil. A non-nil empty
+// token clears it; callers enforce that clearing is only allowed while disabled.
+func (s *Store) UpdateTelegram(ctx context.Context, value config.TelegramConfig, token *string) (Snapshot, error) {
+	value.SetEnabledExplicit(value.Enabled)
+	value.BaseURL = strings.TrimRight(strings.TrimSpace(value.BaseURL), "/")
+	for index := range value.AllowedUserIDs {
+		value.AllowedUserIDs[index] = strings.TrimSpace(value.AllowedUserIDs[index])
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	var currentCipher []byte
+	if err := tx.QueryRowContext(ctx, `SELECT secret FROM config_sections WHERE name = 'telegram'`).Scan(&currentCipher); err != nil {
+		_ = tx.Rollback()
+		return Snapshot{}, err
+	}
+	currentToken := ""
+	if len(currentCipher) > 0 {
+		plain, decryptErr := s.decrypt(currentCipher, "telegram:token")
+		if decryptErr != nil {
+			_ = tx.Rollback()
+			return Snapshot{}, decryptErr
+		}
+		currentToken = string(plain)
+	}
+	if token != nil {
+		currentToken = strings.TrimSpace(*token)
+	}
+	value.Token = currentToken
+	value.TokenEnv = ""
+	if err := config.ValidateTelegram(value); err != nil {
+		_ = tx.Rollback()
+		return Snapshot{}, err
+	}
+	data, err := json.Marshal(toPersistedTelegram(value))
+	if err != nil {
+		_ = tx.Rollback()
+		return Snapshot{}, err
+	}
+	var cipherValue []byte
+	if currentToken != "" {
+		cipherValue, err = s.encrypt([]byte(currentToken), "telegram:token")
+		if err != nil {
+			_ = tx.Rollback()
+			return Snapshot{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE config_sections SET revision = revision + 1, data = ?, secret = ? WHERE name = 'telegram'`, string(data), nullableBytes(cipherValue)); err != nil {
 		_ = tx.Rollback()
 		return Snapshot{}, err
 	}
@@ -1175,6 +1287,20 @@ func toPersistedOpenILink(value config.OpenILinkConfig) persistedOpenILink {
 
 func fromPersistedOpenILink(value persistedOpenILink) config.OpenILinkConfig {
 	return config.OpenILinkConfig{Enabled: value.Enabled, BaseURL: value.BaseURL, AllowedUserIDs: nonNil(value.AllowedUserIDs), HTTPTimeoutSecond: value.HTTPTimeoutSecond}
+}
+
+func toPersistedTelegram(value config.TelegramConfig) persistedTelegram {
+	return persistedTelegram{
+		Enabled: value.Enabled, BaseURL: value.BaseURL, AllowedUserIDs: nonNil(value.AllowedUserIDs),
+		HTTPTimeoutSecond: value.HTTPTimeoutSecond, PollTimeoutSecond: value.PollTimeoutSecond,
+	}
+}
+
+func fromPersistedTelegram(value persistedTelegram) config.TelegramConfig {
+	return config.TelegramConfig{
+		Enabled: value.Enabled, BaseURL: value.BaseURL, AllowedUserIDs: nonNil(value.AllowedUserIDs),
+		HTTPTimeoutSecond: value.HTTPTimeoutSecond, PollTimeoutSecond: value.PollTimeoutSecond,
+	}
 }
 
 func toPersistedWeb(value config.WebConfig) persistedWeb {

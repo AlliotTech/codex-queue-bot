@@ -33,7 +33,7 @@ export interface Activity {
   id: number
   type: string
   target: string
-  source: "web" | "openilink" | "system"
+  source: "web" | "openilink" | "telegram" | "system"
   actor: string
   attempts: number
   at: string
@@ -47,6 +47,7 @@ export interface Dashboard {
   restart_required: boolean
   restart_fields: string[]
   openilink: { state: string; error?: string; updated_at: string | null }
+  telegram: { state: string; error?: string; updated_at: string | null }
   concurrency: { current: number; max: number }
   targets: Target[]
   activities: Activity[]
@@ -94,6 +95,14 @@ export interface Configuration {
     token_set: boolean
     allowed_user_ids: string[]
     http_timeout_seconds: number
+  }
+  telegram: {
+    enabled: boolean
+    base_url: string
+    token_set: boolean
+    allowed_user_ids: string[]
+    http_timeout_seconds: number
+    poll_timeout_seconds: number
   }
   web: {
     listen_address: string
@@ -176,6 +185,10 @@ export function updateCodex(csrf: string, value: Configuration["codex"]) {
 
 export function updateOpenILink(csrf: string, value: Omit<Configuration["openilink"], "token_set"> & { token: string; clear_token: boolean }) {
   return jsonRequest<Configuration>("/api/v1/config/openilink", csrf, "PUT", value)
+}
+
+export function updateTelegram(csrf: string, value: Omit<Configuration["telegram"], "token_set"> & { token: string; clear_token: boolean }) {
+  return jsonRequest<Configuration>("/api/v1/config/telegram", csrf, "PUT", value)
 }
 
 export function updateWeb(csrf: string, value: Configuration["web"]) {

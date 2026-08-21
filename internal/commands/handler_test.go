@@ -201,6 +201,39 @@ func TestKeepaliveEnglishAliases(t *testing.T) {
 	}
 }
 
+func TestTelegramUsesChatForRepliesAndUserForAuthorization(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := newCommandTestManager(ctx, []config.Target{{Name: "primary"}})
+	recorder := &replyRecorder{messages: make(chan replyMessage, 2)}
+	handler := NewAdapter(manager, recorder, nil, []string{"123"}, jobs.SourceTelegram, "Telegram")
+	incoming := hub.Incoming{SenderID: "123", ReplyTo: "-456", TraceID: "9", Text: "/status primary"}
+	handler.Handle(ctx, incoming)
+	if message := receiveReply(t, recorder); message.to != "-456" || message.traceID != "9" {
+		t.Fatalf("Telegram reply = %+v", message)
+	}
+	incoming.SenderID = "999"
+	handler.Handle(ctx, incoming)
+	if message := receiveReply(t, recorder); message.to != "-456" || message.content != "无权限执行此命令。" {
+		t.Fatalf("unauthorized Telegram reply = %+v", message)
+	}
+}
+
+func TestTelegramBareStartShowsHelp(t *testing.T) {
+	manager := newCommandTestManager(context.Background(), []config.Target{{Name: "primary"}})
+	recorder := &replyRecorder{messages: make(chan replyMessage, 1)}
+	handler := NewAdapter(manager, recorder, nil, nil, jobs.SourceTelegram, "Telegram")
+	handler.Handle(context.Background(), hub.Incoming{SenderID: "123", ReplyTo: "123", Text: "/start"})
+	message := receiveReply(t, recorder)
+	if !strings.Contains(message.content, "可用命令") {
+		t.Fatalf("Telegram /start reply = %+v", message)
+	}
+	snapshots, _ := manager.Snapshots(nil)
+	if snapshots[0].State != jobs.StateIdle {
+		t.Fatalf("Telegram /start unexpectedly started queue: %+v", snapshots[0])
+	}
+}
+
 func TestKeepaliveStatusUnknownTargetAndHelp(t *testing.T) {
 	manager := newCommandTestManager(context.Background(), []config.Target{{Name: "primary"}})
 	handler := New(manager, nil, nil, nil)

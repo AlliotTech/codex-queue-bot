@@ -530,6 +530,33 @@ func TestOpenILinkTokenMaskKeepAndClearRules(t *testing.T) {
 	}
 }
 
+func TestTelegramTokenMaskKeepAndClearRules(t *testing.T) {
+	fixture := newDatabaseWebFixture(t, &testRunner{})
+	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
+	base := `{"enabled":false,"base_url":"https://api.telegram.org","allowed_user_ids":["123"],"http_timeout_seconds":45,"poll_timeout_seconds":30,`
+
+	setToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"telegram-secret","clear_token":false}`, cookie, csrf, "192.0.2.20:1")
+	if setToken.Code != http.StatusOK || strings.Contains(setToken.Body.String(), "telegram-secret") || !strings.Contains(setToken.Body.String(), `"token_set":true`) {
+		t.Fatalf("set Telegram token = %d %s", setToken.Code, setToken.Body.String())
+	}
+	keepToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"","clear_token":false}`, cookie, csrf, "192.0.2.20:1")
+	if keepToken.Code != http.StatusOK || !strings.Contains(keepToken.Body.String(), `"token_set":true`) {
+		t.Fatalf("keep Telegram token = %d %s", keepToken.Code, keepToken.Body.String())
+	}
+	persisted, err := fixture.store.Load(context.Background())
+	if err != nil || persisted.Config.Telegram.Token != "telegram-secret" {
+		t.Fatalf("persisted Telegram token = %q, err=%v", persisted.Config.Telegram.Token, err)
+	}
+	invalidClear := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", `{"enabled":true,"base_url":"https://api.telegram.org","allowed_user_ids":[],"http_timeout_seconds":45,"poll_timeout_seconds":30,"token":"","clear_token":true}`, cookie, csrf, "192.0.2.20:1")
+	if invalidClear.Code != http.StatusBadRequest {
+		t.Fatalf("enabled Telegram token clear = %d %s", invalidClear.Code, invalidClear.Body.String())
+	}
+	clearToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"","clear_token":true}`, cookie, csrf, "192.0.2.20:1")
+	if clearToken.Code != http.StatusOK || !strings.Contains(clearToken.Body.String(), `"token_set":false`) {
+		t.Fatalf("clear Telegram token = %d %s", clearToken.Code, clearToken.Body.String())
+	}
+}
+
 func TestRestartRequiredClearsForNewServerStartup(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
 	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")

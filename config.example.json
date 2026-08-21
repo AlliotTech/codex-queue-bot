@@ -8,6 +8,16 @@
     ],
     "http_timeout_seconds": 15
   },
+  "telegram": {
+    "enabled": false,
+    "base_url": "https://api.telegram.org",
+    "token_env": "TELEGRAM_BOT_TOKEN",
+    "allowed_user_ids": [
+      "123456789"
+    ],
+    "http_timeout_seconds": 45,
+    "poll_timeout_seconds": 30
+  },
   "web": {
     "listen_address": ":8080",
     "admin_username": "admin",

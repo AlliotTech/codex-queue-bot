@@ -66,6 +66,13 @@ func TestFreshDatabaseSetupEncryptionPermissionsAndPersistence(t *testing.T) {
 	if err != nil || snapshot.Config.OpenILink.Token != token {
 		t.Fatalf("UpdateOpenILink: snapshot=%+v err=%v", snapshot, err)
 	}
+	telegramToken := "telegram-plain-secret"
+	telegramConfig := snapshot.Config.Telegram
+	telegramConfig.Enabled = false
+	snapshot, err = store.UpdateTelegram(ctx, telegramConfig, &telegramToken)
+	if err != nil || snapshot.Config.Telegram.Token != telegramToken {
+		t.Fatalf("UpdateTelegram: snapshot=%+v err=%v", snapshot, err)
+	}
 
 	updated := created
 	updated.Name = "renamed"
@@ -82,7 +89,7 @@ func TestFreshDatabaseSetupEncryptionPermissionsAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"target-plain-secret", "openilink-plain-secret", "correct-horse-battery"} {
+	for _, forbidden := range []string{"target-plain-secret", "openilink-plain-secret", "telegram-plain-secret", "correct-horse-battery"} {
 		if strings.Contains(string(raw), forbidden) {
 			t.Fatalf("database contains plaintext %q", forbidden)
 		}
@@ -102,6 +109,9 @@ func TestFreshDatabaseSetupEncryptionPermissionsAndPersistence(t *testing.T) {
 	}
 	if persisted.Config.OpenILink.Token != token {
 		t.Fatalf("persisted token = %q", persisted.Config.OpenILink.Token)
+	}
+	if persisted.Config.Telegram.Token != telegramToken {
+		t.Fatalf("persisted Telegram token = %q", persisted.Config.Telegram.Token)
 	}
 }
 
@@ -147,6 +157,37 @@ func TestSchemaUpgradeAppliesMissingMigrations(t *testing.T) {
 	var count int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil || count != len(migrations) {
 		t.Fatalf("migration count = %d, err=%v", count, err)
+	}
+}
+
+func TestSchemaUpgradeAddsTelegramSectionToInitializedDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "upgrade-telegram.db")
+	key := encodedKey('t')
+	store, err := Open(ctx, Options{Path: path, MasterKeyBase64: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM config_sections WHERE name = 'telegram'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, Options{Path: path, MasterKeyBase64: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	snapshot, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Config.Telegram.Enabled || snapshot.Config.Telegram.BaseURL != "https://api.telegram.org" || snapshot.Config.Telegram.HTTPTimeoutSecond != 45 || snapshot.Config.Telegram.PollTimeoutSecond != 30 {
+		t.Fatalf("migrated Telegram config = %+v", snapshot.Config.Telegram)
 	}
 }
 

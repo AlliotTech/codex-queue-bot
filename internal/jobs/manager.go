@@ -48,6 +48,8 @@ type Messenger interface {
 type Subscriber struct {
 	Recipient string
 	TraceID   string
+	Key       string
+	Messenger Messenger
 }
 
 type Source string
@@ -55,6 +57,7 @@ type Source string
 const (
 	SourceWeb       Source = "web"
 	SourceOpenILink Source = "openilink"
+	SourceTelegram  Source = "telegram"
 	SourceSystem    Source = "system"
 )
 
@@ -326,7 +329,11 @@ func (m *Manager) StartWithOperation(names []string, subscriber Subscriber, oper
 		target := m.targets[key]
 		current := m.jobs[key]
 		if subscriber.Recipient != "" {
-			current.subscribers[subscriber.Recipient] = subscriber
+			subscriberKey := strings.TrimSpace(subscriber.Key)
+			if subscriberKey == "" {
+				subscriberKey = subscriber.Recipient
+			}
+			current.subscribers[subscriberKey] = subscriber
 		}
 		if current.state == StateRunning {
 			result.Already = append(result.Already, target.Name)
@@ -1280,7 +1287,7 @@ func (m *Manager) signalTargetLocked(key string) {
 }
 
 func (m *Manager) notifySuccess(target string, attempt int, elapsed time.Duration, subscribers []Subscriber) {
-	if m.messenger == nil {
+	if len(subscribers) == 0 {
 		return
 	}
 	m.mu.Lock()
@@ -1294,10 +1301,17 @@ func (m *Manager) notifySuccess(target string, attempt int, elapsed time.Duratio
 }
 
 func (m *Manager) notifySubscriber(target, message string, subscriber Subscriber) {
+	messenger := subscriber.Messenger
+	if messenger == nil {
+		messenger = m.messenger
+	}
+	if messenger == nil {
+		return
+	}
 	delay := 2 * time.Second
 	for {
 		ctx, cancel := context.WithTimeout(m.root, 20*time.Second)
-		err := m.messenger.Send(ctx, subscriber.Recipient, message, subscriber.TraceID)
+		err := messenger.Send(ctx, subscriber.Recipient, message, subscriber.TraceID)
 		cancel()
 		if err == nil {
 			return
@@ -1465,7 +1479,7 @@ func normalizeName(value string) string {
 
 func normalizeOperation(operation Operation) Operation {
 	switch operation.Source {
-	case SourceWeb, SourceOpenILink, SourceSystem:
+	case SourceWeb, SourceOpenILink, SourceTelegram, SourceSystem:
 	default:
 		operation.Source = SourceSystem
 	}

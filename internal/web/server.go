@@ -40,6 +40,7 @@ const (
 type Options struct {
 	Manager           *jobs.Manager
 	OpenILinkStatus   *hub.StatusStore
+	TelegramStatus    *hub.StatusStore
 	Username          string
 	Password          string
 	CookieSecure      bool
@@ -60,6 +61,7 @@ type Options struct {
 type Server struct {
 	manager        *jobs.Manager
 	status         *hub.StatusStore
+	telegramStatus *hub.StatusStore
 	username       string
 	passwordHash   [32]byte
 	cookieSecure   bool
@@ -123,6 +125,9 @@ func New(options Options) (*Server, error) {
 	if options.OpenILinkStatus == nil {
 		options.OpenILinkStatus = hub.NewStatusStore(hub.StatusDisabled)
 	}
+	if options.TelegramStatus == nil {
+		options.TelegramStatus = hub.NewStatusStore(hub.StatusDisabled)
+	}
 	options.Username = strings.TrimSpace(options.Username)
 	if options.ConfigStore == nil {
 		if options.Username == "" {
@@ -164,6 +169,7 @@ func New(options Options) (*Server, error) {
 	server := &Server{
 		manager:         options.Manager,
 		status:          options.OpenILinkStatus,
+		telegramStatus:  options.TelegramStatus,
 		username:        options.Username,
 		passwordHash:    sha256.Sum256([]byte(options.Password)),
 		cookieSecure:    options.CookieSecure,
@@ -227,6 +233,7 @@ func (s *Server) routes() {
 	authorized.GET("/config", s.getConfig)
 	authorized.PUT("/config/codex", s.requireCSRF(), s.updateCodexConfig)
 	authorized.PUT("/config/openilink", s.requireCSRF(), s.updateOpenILinkConfig)
+	authorized.PUT("/config/telegram", s.requireCSRF(), s.updateTelegramConfig)
 	authorized.PUT("/config/web", s.requireCSRF(), s.updateWebConfig)
 	authorized.PUT("/account", s.requireCSRF(), s.updateAccount)
 	authorized.POST("/targets", s.requireCSRF(), s.createTarget)
@@ -319,7 +326,7 @@ func (s *Server) logout(c *gin.Context) {
 
 func (s *Server) dashboard(c *gin.Context) {
 	snapshot, activities := s.manager.DashboardSnapshot()
-	c.JSON(http.StatusOK, s.dashboardPayload(snapshot, activities, s.status.Snapshot()))
+	c.JSON(http.StatusOK, s.dashboardPayload(snapshot, activities, s.status.Snapshot(), s.telegramStatus.Snapshot()))
 }
 
 func (s *Server) actions(c *gin.Context) {

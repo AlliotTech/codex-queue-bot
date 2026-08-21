@@ -18,6 +18,9 @@ import (
 
 const (
 	defaultHubBaseURL       = "http://127.0.0.1:9800"
+	defaultTelegramBaseURL  = "https://api.telegram.org"
+	defaultTelegramHTTP     = 45
+	defaultTelegramPoll     = 30
 	defaultCodexBinary      = "codex"
 	defaultPromptsFile      = "prompts.txt"
 	defaultRequestTimeout   = 180
@@ -43,6 +46,7 @@ const MinimumAdminPasswordLength = 5
 
 type Config struct {
 	OpenILink OpenILinkConfig `json:"openilink"`
+	Telegram  TelegramConfig  `json:"telegram"`
 	Codex     CodexConfig     `json:"codex"`
 	Web       WebConfig       `json:"web"`
 }
@@ -57,6 +61,19 @@ type OpenILinkConfig struct {
 	TokenEnv          string   `json:"token_env,omitempty"`
 	AllowedUserIDs    []string `json:"allowed_user_ids,omitempty"`
 	HTTPTimeoutSecond int      `json:"http_timeout_seconds,omitempty"`
+	enabledSet        bool
+}
+
+type TelegramConfig struct {
+	// As with OpenILink, an omitted enabled field keeps legacy JSON convenient:
+	// configuring a token enables the adapter unless enabled is explicitly false.
+	Enabled           bool     `json:"enabled,omitempty"`
+	BaseURL           string   `json:"base_url,omitempty"`
+	Token             string   `json:"token,omitempty"`
+	TokenEnv          string   `json:"token_env,omitempty"`
+	AllowedUserIDs    []string `json:"allowed_user_ids,omitempty"`
+	HTTPTimeoutSecond int      `json:"http_timeout_seconds,omitempty"`
+	PollTimeoutSecond int      `json:"poll_timeout_seconds,omitempty"`
 	enabledSet        bool
 }
 
@@ -85,6 +102,23 @@ func (c *OpenILinkConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*c = OpenILinkConfig(decoded)
+	_, c.enabledSet = fields["enabled"]
+	return nil
+}
+
+func (c *TelegramConfig) UnmarshalJSON(data []byte) error {
+	type plain TelegramConfig
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*c = TelegramConfig(decoded)
 	_, c.enabledSet = fields["enabled"]
 	return nil
 }
@@ -193,6 +227,19 @@ func (c *Config) applyDefaults(configDir string) {
 		c.OpenILink.HTTPTimeoutSecond = defaultHTTPTimeout
 	}
 
+	if strings.TrimSpace(c.Telegram.BaseURL) == "" {
+		c.Telegram.BaseURL = defaultTelegramBaseURL
+	}
+	c.Telegram.BaseURL = strings.TrimRight(strings.TrimSpace(c.Telegram.BaseURL), "/")
+	c.Telegram.Token = strings.TrimSpace(c.Telegram.Token)
+	c.Telegram.TokenEnv = strings.TrimSpace(c.Telegram.TokenEnv)
+	if c.Telegram.HTTPTimeoutSecond == 0 {
+		c.Telegram.HTTPTimeoutSecond = defaultTelegramHTTP
+	}
+	if c.Telegram.PollTimeoutSecond == 0 {
+		c.Telegram.PollTimeoutSecond = defaultTelegramPoll
+	}
+
 	if strings.TrimSpace(c.Codex.Binary) == "" {
 		c.Codex.Binary = defaultCodexBinary
 	}
@@ -248,6 +295,13 @@ func (c *Config) resolveSecrets() error {
 			return fmt.Errorf("openilink.token_env %q is not set", c.OpenILink.TokenEnv)
 		}
 	}
+	telegramEnabled := c.Telegram.IsTelegramEnabled()
+	if telegramEnabled && c.Telegram.Token == "" && c.Telegram.TokenEnv != "" {
+		c.Telegram.Token = os.Getenv(c.Telegram.TokenEnv)
+		if c.Telegram.Token == "" {
+			return fmt.Errorf("telegram.token_env %q is not set", c.Telegram.TokenEnv)
+		}
+	}
 	for i := range c.Codex.Targets {
 		t := &c.Codex.Targets[i]
 		if t.APIKey == "" && t.APIKeyEnv != "" {
@@ -281,6 +335,23 @@ func (c *Config) validate(allowEmptyTargets bool) error {
 		}
 		if c.OpenILink.HTTPTimeoutSecond <= 0 {
 			return errors.New("openilink.http_timeout_seconds must be positive")
+		}
+	}
+	if c.Telegram.IsTelegramEnabled() {
+		if err := validateHTTPURL("telegram.base_url", c.Telegram.BaseURL); err != nil {
+			return err
+		}
+		if strings.TrimSpace(c.Telegram.Token) == "" {
+			return errors.New("telegram token is required (set token or token_env)")
+		}
+		if c.Telegram.HTTPTimeoutSecond <= 0 {
+			return errors.New("telegram.http_timeout_seconds must be positive")
+		}
+		if c.Telegram.PollTimeoutSecond <= 0 {
+			return errors.New("telegram.poll_timeout_seconds must be positive")
+		}
+		if c.Telegram.HTTPTimeoutSecond <= c.Telegram.PollTimeoutSecond {
+			return errors.New("telegram.http_timeout_seconds must be greater than poll_timeout_seconds")
 		}
 	}
 	if strings.TrimSpace(c.Codex.Binary) == "" {
@@ -363,6 +434,13 @@ func DefaultDatabaseConfig() Config {
 			HTTPTimeoutSecond: defaultHTTPTimeout,
 			enabledSet:        true,
 		},
+		Telegram: TelegramConfig{
+			Enabled:           false,
+			BaseURL:           defaultTelegramBaseURL,
+			HTTPTimeoutSecond: defaultTelegramHTTP,
+			PollTimeoutSecond: defaultTelegramPoll,
+			enabledSet:        true,
+		},
 		Codex: CodexConfig{
 			Binary:               defaultCodexBinary,
 			PromptsFile:          defaultPromptsFile,
@@ -435,6 +513,26 @@ func ValidateOpenILink(openILink OpenILinkConfig) error {
 	return cfg.ValidateAllowEmptyTargets()
 }
 
+// ValidateTelegram validates the Telegram Bot API section with its resolved token.
+func ValidateTelegram(telegram TelegramConfig) error {
+	if err := validateHTTPURL("telegram.base_url", strings.TrimRight(strings.TrimSpace(telegram.BaseURL), "/")); err != nil {
+		return err
+	}
+	if telegram.HTTPTimeoutSecond <= 0 {
+		return errors.New("telegram.http_timeout_seconds must be positive")
+	}
+	if telegram.PollTimeoutSecond <= 0 {
+		return errors.New("telegram.poll_timeout_seconds must be positive")
+	}
+	if telegram.HTTPTimeoutSecond <= telegram.PollTimeoutSecond {
+		return errors.New("telegram.http_timeout_seconds must be greater than poll_timeout_seconds")
+	}
+	telegram.enabledSet = true
+	cfg := DefaultDatabaseConfig()
+	cfg.Telegram = telegram
+	return cfg.ValidateAllowEmptyTargets()
+}
+
 // ValidateWeb validates the Web section independently.
 func ValidateWeb(web WebConfig) error {
 	if strings.TrimSpace(web.ListenAddress) == "" {
@@ -492,6 +590,20 @@ func (c *OpenILinkConfig) SetEnabledExplicit(value bool) {
 	c.enabledSet = true
 }
 
+func (c TelegramConfig) IsTelegramEnabled() bool {
+	if c.enabledSet {
+		return c.Enabled
+	}
+	return c.Enabled || strings.TrimSpace(c.Token) != "" || strings.TrimSpace(c.TokenEnv) != ""
+}
+
+func (c *Config) TelegramEnabled() bool { return c.Telegram.IsTelegramEnabled() }
+
+func (c *TelegramConfig) SetEnabledExplicit(value bool) {
+	c.Enabled = value
+	c.enabledSet = true
+}
+
 // AdminPassword reads the administrator password from the configured
 // environment variable. It intentionally does not retain or log the value.
 func (c *Config) AdminPassword() (string, error) {
@@ -528,6 +640,14 @@ func (c *Config) KeepaliveMax() time.Duration {
 
 func (c *Config) HTTPTimeout() time.Duration {
 	return time.Duration(c.OpenILink.HTTPTimeoutSecond) * time.Second
+}
+
+func (c *Config) TelegramHTTPTimeout() time.Duration {
+	return time.Duration(c.Telegram.HTTPTimeoutSecond) * time.Second
+}
+
+func (c *Config) TelegramPollTimeout() time.Duration {
+	return time.Duration(c.Telegram.PollTimeoutSecond) * time.Second
 }
 
 func validateHTTPURL(label, raw string) error {

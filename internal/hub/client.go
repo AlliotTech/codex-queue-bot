@@ -32,6 +32,7 @@ type Incoming struct {
 	EventID  string
 	TraceID  string
 	SenderID string
+	ReplyTo  string
 	Text     string
 }
 

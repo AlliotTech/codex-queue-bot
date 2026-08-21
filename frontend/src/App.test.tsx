@@ -24,6 +24,7 @@ const dashboard = {
   restart_required: false,
   restart_fields: [],
   openilink: { state: "disabled", updated_at: null },
+  telegram: { state: "disabled", updated_at: null },
   concurrency: { current: 0, max: 2 },
   targets: [{ id: 1, name: "main", model: "gpt-test", api_host: "api.example.test", busy: false, queue: { state: "idle", attempts: 0, started_at: null, last_attempt: null, next_attempt: null, finished_at: null }, keepalive: { state: "stopped", requests: 0, started_at: null, last_request: null, last_success: null, last_failure: null, next_request: null, stopped_at: null } }],
   activities: [],
@@ -36,6 +37,7 @@ const configuration = {
   restart_fields: [],
   codex: { binary: "codex", prompts_file: "prompts.txt", request_timeout_seconds: 180, retry_min_seconds: 3, retry_max_seconds: 8, keepalive_min_seconds: 2700, keepalive_max_seconds: 3300, max_parallel: 2, success_message: "开蹬", reasoning_effort: "low", config_overrides: [] },
   openilink: { enabled: false, base_url: "http://127.0.0.1:9800", token_set: false, allowed_user_ids: [], http_timeout_seconds: 15 },
+  telegram: { enabled: false, base_url: "https://api.telegram.org", token_set: false, allowed_user_ids: [], http_timeout_seconds: 45, poll_timeout_seconds: 30 },
   web: { listen_address: ":8080", cookie_secure: false, trusted_proxies: [], activity_limit: 200 },
   account: { username: "admin" },
   targets: [{ id: 1, sort_order: 0, name: "main", api_base_url: "https://api.example.test/v1", api_key_set: true, model: "gpt-test", wire_api: "responses", config_overrides: [], busy: false }],
@@ -164,5 +166,32 @@ describe("console", () => {
     fireEvent.change(screen.getByLabelText("重试最小秒数"), { target: { value: "3" } })
     fireEvent.click(screen.getByRole("button", { name: "保存任务参数" }))
     expect(await screen.findByRole("alert")).toHaveTextContent("服务器拒绝了配置")
+  })
+
+  it("saves Telegram bot configuration without echoing its token", async () => {
+    MockEventSource.instances = []
+    vi.stubGlobal("EventSource", MockEventSource)
+    const saved = { ...configuration, revision: 4, telegram: { ...configuration.telegram, enabled: true, token_set: true, allowed_user_ids: ["123"] }, restart_required: true, restart_fields: ["telegram.enabled", "telegram.token"] }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith("/setup/status")) return publicStatus(false)
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", csrf_token: "csrf", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/dashboard")) return new Response(JSON.stringify(dashboard), { status: 200 })
+      if (url.endsWith("/config") && !init?.method) return new Response(JSON.stringify(configuration), { status: 200 })
+      if (url.endsWith("/config/telegram") && init?.method === "PUT") return new Response(JSON.stringify(saved), { status: 200 })
+      throw new Error(`unexpected request ${url} ${init?.method}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    render(<App />)
+    await screen.findByText("main")
+    fireEvent.click(screen.getByRole("button", { name: "配置" }))
+    fireEvent.click(await screen.findByRole("button", { name: "消息入口" }))
+    fireEvent.click(screen.getByLabelText("启用 Telegram Bot"))
+    fireEvent.change(screen.getByLabelText("Bot Token"), { target: { value: "telegram-secret" } })
+    fireEvent.change(screen.getByLabelText("允许的 Telegram 用户 ID"), { target: { value: "123" } })
+    fireEvent.click(screen.getByRole("button", { name: "保存 Telegram" }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/v1/config/telegram", expect.objectContaining({ method: "PUT" })))
+    expect(screen.queryByText("telegram-secret")).not.toBeInTheDocument()
+    expect(await screen.findByText("Telegram 配置已保存，重启后生效")).toBeInTheDocument()
   })
 })

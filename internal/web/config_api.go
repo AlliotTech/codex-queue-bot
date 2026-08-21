@@ -48,6 +48,16 @@ type openILinkConfigRequest struct {
 	HTTPTimeoutSecond int      `json:"http_timeout_seconds"`
 }
 
+type telegramConfigRequest struct {
+	Enabled           bool     `json:"enabled"`
+	BaseURL           string   `json:"base_url"`
+	Token             string   `json:"token"`
+	ClearToken        bool     `json:"clear_token"`
+	AllowedUserIDs    []string `json:"allowed_user_ids"`
+	HTTPTimeoutSecond int      `json:"http_timeout_seconds"`
+	PollTimeoutSecond int      `json:"poll_timeout_seconds"`
+}
+
 type webConfigRequest struct {
 	ListenAddress  string   `json:"listen_address"`
 	CookieSecure   bool     `json:"cookie_secure"`
@@ -79,6 +89,7 @@ type configurationResponse struct {
 	RestartFields         []string                   `json:"restart_fields"`
 	Codex                 codexConfigurationResponse `json:"codex"`
 	OpenILink             openILinkConfiguration     `json:"openilink"`
+	Telegram              telegramConfiguration      `json:"telegram"`
 	Web                   webConfigurationResponse   `json:"web"`
 	Account               accountConfiguration       `json:"account"`
 	Targets               []targetConfiguration      `json:"targets"`
@@ -104,6 +115,15 @@ type openILinkConfiguration struct {
 	TokenSet          bool     `json:"token_set"`
 	AllowedUserIDs    []string `json:"allowed_user_ids"`
 	HTTPTimeoutSecond int      `json:"http_timeout_seconds"`
+}
+
+type telegramConfiguration struct {
+	Enabled           bool     `json:"enabled"`
+	BaseURL           string   `json:"base_url"`
+	TokenSet          bool     `json:"token_set"`
+	AllowedUserIDs    []string `json:"allowed_user_ids"`
+	HTTPTimeoutSecond int      `json:"http_timeout_seconds"`
+	PollTimeoutSecond int      `json:"poll_timeout_seconds"`
 }
 
 type webConfigurationResponse struct {
@@ -257,6 +277,56 @@ func (s *Server) updateOpenILinkConfig(c *gin.Context) {
 		return
 	}
 	snapshot, err := s.configStore.UpdateOpenILink(c.Request.Context(), value, token)
+	if err != nil {
+		s.writeConfigurationError(c, err)
+		return
+	}
+	s.setConfiguration(snapshot)
+	c.JSON(http.StatusOK, s.configurationPayload(snapshot))
+}
+
+func (s *Server) updateTelegramConfig(c *gin.Context) {
+	if !s.requireConfigStore(c) {
+		return
+	}
+	var request telegramConfigRequest
+	if err := decodeJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式不正确"})
+		return
+	}
+	if request.ClearToken && request.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "只能在 Telegram 关闭时清除 Token"})
+		return
+	}
+	if request.ClearToken && strings.TrimSpace(request.Token) != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不能同时设置并清除 Token"})
+		return
+	}
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
+	value := config.TelegramConfig{
+		Enabled: request.Enabled, BaseURL: request.BaseURL,
+		AllowedUserIDs: cleanStrings(request.AllowedUserIDs), HTTPTimeoutSecond: request.HTTPTimeoutSecond,
+		PollTimeoutSecond: request.PollTimeoutSecond,
+	}
+	current := s.currentConfiguration()
+	effectiveToken := current.Config.Telegram.Token
+	var token *string
+	if trimmed := strings.TrimSpace(request.Token); trimmed != "" {
+		token = &trimmed
+		effectiveToken = trimmed
+	} else if request.ClearToken {
+		empty := ""
+		token = &empty
+		effectiveToken = ""
+	}
+	value.Token = effectiveToken
+	value.SetEnabledExplicit(request.Enabled)
+	if err := config.ValidateTelegram(value); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	snapshot, err := s.configStore.UpdateTelegram(c.Request.Context(), value, token)
 	if err != nil {
 		s.writeConfigurationError(c, err)
 		return
@@ -576,6 +646,11 @@ func (s *Server) configurationPayload(snapshot storage.Snapshot) configurationRe
 			TokenSet: snapshot.Config.OpenILink.Token != "", AllowedUserIDs: nonNilStrings(snapshot.Config.OpenILink.AllowedUserIDs),
 			HTTPTimeoutSecond: snapshot.Config.OpenILink.HTTPTimeoutSecond,
 		},
+		Telegram: telegramConfiguration{
+			Enabled: snapshot.Config.Telegram.Enabled, BaseURL: snapshot.Config.Telegram.BaseURL,
+			TokenSet: snapshot.Config.Telegram.Token != "", AllowedUserIDs: nonNilStrings(snapshot.Config.Telegram.AllowedUserIDs),
+			HTTPTimeoutSecond: snapshot.Config.Telegram.HTTPTimeoutSecond, PollTimeoutSecond: snapshot.Config.Telegram.PollTimeoutSecond,
+		},
 		Web: webConfigurationResponse{
 			ListenAddress: snapshot.Config.Web.ListenAddress, CookieSecure: snapshot.Config.Web.CookieSecure,
 			TrustedProxies: nonNilStrings(snapshot.Config.Web.TrustedProxies), ActivityLimit: snapshot.Config.Web.ActivityLimit,
@@ -623,6 +698,24 @@ func (s *Server) restartFields(current config.Config) []string {
 	}
 	if current.OpenILink.HTTPTimeoutSecond != startup.OpenILink.HTTPTimeoutSecond {
 		fields = append(fields, "openilink.http_timeout_seconds")
+	}
+	if current.Telegram.Enabled != startup.Telegram.Enabled {
+		fields = append(fields, "telegram.enabled")
+	}
+	if current.Telegram.BaseURL != startup.Telegram.BaseURL {
+		fields = append(fields, "telegram.base_url")
+	}
+	if current.Telegram.Token != startup.Telegram.Token {
+		fields = append(fields, "telegram.token")
+	}
+	if !slices.Equal(current.Telegram.AllowedUserIDs, startup.Telegram.AllowedUserIDs) {
+		fields = append(fields, "telegram.allowed_user_ids")
+	}
+	if current.Telegram.HTTPTimeoutSecond != startup.Telegram.HTTPTimeoutSecond {
+		fields = append(fields, "telegram.http_timeout_seconds")
+	}
+	if current.Telegram.PollTimeoutSecond != startup.Telegram.PollTimeoutSecond {
+		fields = append(fields, "telegram.poll_timeout_seconds")
 	}
 	if current.Web.ListenAddress != startup.Web.ListenAddress {
 		fields = append(fields, "web.listen_address")

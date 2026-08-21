@@ -17,11 +17,21 @@ type Handler struct {
 	sender  jobs.Messenger
 	logger  *slog.Logger
 	allowed map[string]struct{}
+	source  jobs.Source
+	adapter string
 }
 
 func New(manager *jobs.Manager, sender jobs.Messenger, logger *slog.Logger, allowedUserIDs []string) *Handler {
+	return NewAdapter(manager, sender, logger, allowedUserIDs, jobs.SourceOpenILink, "OpenILink")
+}
+
+func NewAdapter(manager *jobs.Manager, sender jobs.Messenger, logger *slog.Logger, allowedUserIDs []string, source jobs.Source, adapter string) *Handler {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	adapter = strings.TrimSpace(adapter)
+	if adapter == "" {
+		adapter = string(source)
 	}
 	allowed := make(map[string]struct{}, len(allowedUserIDs))
 	for _, id := range allowedUserIDs {
@@ -29,7 +39,7 @@ func New(manager *jobs.Manager, sender jobs.Messenger, logger *slog.Logger, allo
 			allowed[id] = struct{}{}
 		}
 	}
-	return &Handler{manager: manager, sender: sender, logger: logger, allowed: allowed}
+	return &Handler{manager: manager, sender: sender, logger: logger, allowed: allowed, source: source, adapter: adapter}
 }
 
 func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
@@ -38,7 +48,7 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 		return
 	}
 	if !h.isAllowed(incoming.SenderID) {
-		h.logger.Warn("ignored command from unauthorized OpenILink user", "sender", incoming.SenderID, "command", command)
+		h.logger.Warn("ignored command from unauthorized messaging user", "adapter", h.adapter, "sender", incoming.SenderID, "command", command)
 		go h.reply(ctx, incoming, "无权限执行此命令。")
 		return
 	}
@@ -46,8 +56,14 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 	targets := splitTargets(args)
 	var response string
 	switch command {
-	case "开挤", "start", "go":
+	case "开挤", "go":
 		response = h.start(targets, incoming)
+	case "start":
+		if h.source == jobs.SourceTelegram && strings.TrimSpace(args) == "" {
+			response = helpText()
+		} else {
+			response = h.start(targets, incoming)
+		}
 	case "停止", "停挤", "stop":
 		response = h.stopFrom(targets, incoming)
 	case "状态", "status":
@@ -69,10 +85,11 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 }
 
 func (h *Handler) start(targets []string, incoming hub.Incoming) string {
+	recipient := replyRecipient(incoming)
 	result := h.manager.StartWithOperation(
 		targets,
-		jobs.Subscriber{Recipient: incoming.SenderID, TraceID: incoming.TraceID},
-		jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID},
+		jobs.Subscriber{Recipient: recipient, TraceID: incoming.TraceID, Key: string(h.source) + ":" + recipient, Messenger: h.sender},
+		jobs.Operation{Source: h.source, Actor: incoming.SenderID},
 	)
 	parts := make([]string, 0, 3)
 	if len(result.Started) > 0 {
@@ -91,7 +108,7 @@ func (h *Handler) start(targets []string, incoming hub.Incoming) string {
 }
 
 func (h *Handler) stopFrom(targets []string, incoming hub.Incoming) string {
-	result := h.manager.StopWithOperation(targets, jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID})
+	result := h.manager.StopWithOperation(targets, jobs.Operation{Source: h.source, Actor: incoming.SenderID})
 	return formatStopResult(result)
 }
 
@@ -117,7 +134,7 @@ func formatStopResult(result jobs.StopResult) string {
 }
 
 func (h *Handler) startKeepaliveFrom(targets []string, incoming hub.Incoming) string {
-	result := h.manager.StartKeepaliveWithOperation(targets, jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID})
+	result := h.manager.StartKeepaliveWithOperation(targets, jobs.Operation{Source: h.source, Actor: incoming.SenderID})
 	return formatKeepaliveStartResult(result)
 }
 
@@ -143,7 +160,7 @@ func formatKeepaliveStartResult(result jobs.KeepaliveStartResult) string {
 }
 
 func (h *Handler) stopKeepaliveFrom(targets []string, incoming hub.Incoming) string {
-	result := h.manager.StopKeepaliveWithOperation(targets, jobs.Operation{Source: jobs.SourceOpenILink, Actor: incoming.SenderID})
+	result := h.manager.StopKeepaliveWithOperation(targets, jobs.Operation{Source: h.source, Actor: incoming.SenderID})
 	return formatKeepaliveStopResult(result)
 }
 
@@ -216,7 +233,7 @@ func (h *Handler) reply(parent context.Context, incoming hub.Incoming, content s
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		ctx, cancel := context.WithTimeout(parent, 20*time.Second)
-		lastErr = h.sender.Send(ctx, incoming.SenderID, content, incoming.TraceID)
+		lastErr = h.sender.Send(ctx, replyRecipient(incoming), content, incoming.TraceID)
 		cancel()
 		if lastErr == nil {
 			return
@@ -231,7 +248,14 @@ func (h *Handler) reply(parent context.Context, incoming hub.Incoming, content s
 			}
 		}
 	}
-	h.logger.Error("failed to reply to OpenILink command", "sender", incoming.SenderID, "error", lastErr)
+	h.logger.Error("failed to reply to messaging command", "adapter", h.adapter, "sender", incoming.SenderID, "error", lastErr)
+}
+
+func replyRecipient(incoming hub.Incoming) string {
+	if recipient := strings.TrimSpace(incoming.ReplyTo); recipient != "" {
+		return recipient
+	}
+	return incoming.SenderID
 }
 
 func (h *Handler) isAllowed(sender string) bool {

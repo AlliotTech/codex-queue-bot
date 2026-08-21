@@ -20,6 +20,8 @@ func (s *Server) events(c *gin.Context) {
 	defer managerSubscription.Close()
 	initialStatus, statusSubscription := s.status.Observe(8)
 	defer statusSubscription.Close()
+	initialTelegramStatus, telegramStatusSubscription := s.telegramStatus.Observe(8)
+	defer telegramStatusSubscription.Close()
 
 	c.Header("Content-Type", "text/event-stream; charset=utf-8")
 	c.Header("Cache-Control", "no-cache, no-transform")
@@ -27,7 +29,7 @@ func (s *Server) events(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 	_, _ = fmt.Fprint(c.Writer, "retry: 3000\n\n")
-	if !s.writeSSE(c, "snapshot", "", s.dashboardPayload(initialState, initialActivities, initialStatus)) {
+	if !s.writeSSE(c, "snapshot", "", s.dashboardPayload(initialState, initialActivities, initialStatus, initialTelegramStatus)) {
 		return
 	}
 
@@ -58,7 +60,7 @@ func (s *Server) events(c *gin.Context) {
 			}
 			switch event.Kind {
 			case jobs.EventState:
-				if event.Snapshot != nil && !s.writeSSE(c, "state", fmt.Sprint(event.ID), s.statePayload(*event.Snapshot, s.status.Snapshot())) {
+				if event.Snapshot != nil && !s.writeSSE(c, "state", fmt.Sprint(event.ID), s.statePayload(*event.Snapshot, s.status.Snapshot(), s.telegramStatus.Snapshot())) {
 					return
 				}
 			case jobs.EventActivity:
@@ -70,12 +72,19 @@ func (s *Server) events(c *gin.Context) {
 			if !ok {
 				return
 			}
-			if !s.writeSSE(c, "state", "", s.statePayload(s.manager.ComprehensiveSnapshot(), status)) {
+			if !s.writeSSE(c, "state", "", s.statePayload(s.manager.ComprehensiveSnapshot(), status, s.telegramStatus.Snapshot())) {
+				return
+			}
+		case status, ok := <-telegramStatusSubscription.Updates:
+			if !ok {
+				return
+			}
+			if !s.writeSSE(c, "state", "", s.statePayload(s.manager.ComprehensiveSnapshot(), s.status.Snapshot(), status)) {
 				return
 			}
 		case <-configurationChanges:
 			configurationChanges = s.configurationChanges()
-			if !s.writeSSE(c, "state", "", s.statePayload(s.manager.ComprehensiveSnapshot(), s.status.Snapshot())) {
+			if !s.writeSSE(c, "state", "", s.statePayload(s.manager.ComprehensiveSnapshot(), s.status.Snapshot(), s.telegramStatus.Snapshot())) {
 				return
 			}
 		case <-sessionChanges:

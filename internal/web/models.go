@@ -14,6 +14,7 @@ type dashboardResponse struct {
 	RestartRequired bool                `json:"restart_required"`
 	RestartFields   []string            `json:"restart_fields"`
 	OpenILink       openILinkResponse   `json:"openilink"`
+	Telegram        openILinkResponse   `json:"telegram"`
 	Concurrency     concurrencyResponse `json:"concurrency"`
 	Targets         []targetResponse    `json:"targets"`
 	Activities      []activityResponse  `json:"activities"`
@@ -26,6 +27,7 @@ type stateResponse struct {
 	RestartRequired bool                `json:"restart_required"`
 	RestartFields   []string            `json:"restart_fields"`
 	OpenILink       openILinkResponse   `json:"openilink"`
+	Telegram        openILinkResponse   `json:"telegram"`
 	Concurrency     concurrencyResponse `json:"concurrency"`
 	Targets         []targetResponse    `json:"targets"`
 }
@@ -84,12 +86,12 @@ type activityResponse struct {
 	Error    string      `json:"error,omitempty"`
 }
 
-func (s *Server) dashboardPayload(snapshot jobs.ManagerSnapshot, activities []jobs.Activity, status hub.StatusSnapshot) dashboardResponse {
-	state := s.statePayload(snapshot, status)
+func (s *Server) dashboardPayload(snapshot jobs.ManagerSnapshot, activities []jobs.Activity, openILinkStatus, telegramStatus hub.StatusSnapshot) dashboardResponse {
+	state := s.statePayload(snapshot, openILinkStatus, telegramStatus)
 	result := dashboardResponse{
 		Version: state.Version, GeneratedAt: state.GeneratedAt,
 		ConfigRevision: state.ConfigRevision, RestartRequired: state.RestartRequired, RestartFields: state.RestartFields,
-		OpenILink: state.OpenILink, Concurrency: state.Concurrency, Targets: state.Targets,
+		OpenILink: state.OpenILink, Telegram: state.Telegram, Concurrency: state.Concurrency, Targets: state.Targets,
 		Activities: make([]activityResponse, 0, len(activities)),
 	}
 	for _, activity := range activities {
@@ -98,16 +100,21 @@ func (s *Server) dashboardPayload(snapshot jobs.ManagerSnapshot, activities []jo
 	return result
 }
 
-func (s *Server) statePayload(snapshot jobs.ManagerSnapshot, status hub.StatusSnapshot) stateResponse {
+func (s *Server) statePayload(snapshot jobs.ManagerSnapshot, openILinkStatus, telegramStatus hub.StatusSnapshot) stateResponse {
 	configuration := s.currentConfiguration()
 	restartFields := s.restartFields(configuration.Config)
 	result := stateResponse{
 		Version: s.version, GeneratedAt: s.now(), ConfigRevision: configuration.Revision,
 		RestartRequired: len(restartFields) > 0, RestartFields: restartFields,
 		OpenILink: openILinkResponse{
-			State:     status.State,
-			Error:     status.Error,
-			UpdatedAt: timePointer(status.UpdatedAt),
+			State:     openILinkStatus.State,
+			Error:     openILinkStatus.Error,
+			UpdatedAt: timePointer(openILinkStatus.UpdatedAt),
+		},
+		Telegram: openILinkResponse{
+			State:     telegramStatus.State,
+			Error:     telegramStatus.Error,
+			UpdatedAt: timePointer(telegramStatus.UpdatedAt),
 		},
 		Concurrency: concurrencyResponse{Current: snapshot.CurrentProcesses, Max: snapshot.MaxParallel},
 		Targets:     make([]targetResponse, 0, len(snapshot.Targets)),
