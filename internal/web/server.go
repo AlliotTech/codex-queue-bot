@@ -30,10 +30,7 @@ import (
 
 const (
 	sessionCookieName = "codex_queue_session"
-	csrfHeaderName    = "X-CSRF-Token"
 	defaultSessionTTL = 12 * time.Hour
-	loginWindow       = 10 * time.Minute
-	loginFailureLimit = 5
 	maxJSONBody       = 64 << 10
 )
 
@@ -56,6 +53,10 @@ type Options struct {
 	ConfigStore       *storage.Store
 	InitialConfig     storage.Snapshot
 	Runner            *codex.Runner
+	// ReloadMessages is called after a persisted OpenILink/Telegram update.
+	// Implementations should synchronously swap clients (or return an error)
+	// so the new settings take effect without a process restart.
+	ReloadMessages func(context.Context, storage.Snapshot) error
 }
 
 type Server struct {
@@ -76,11 +77,11 @@ type Server struct {
 	engine         *gin.Engine
 	configStore    *storage.Store
 	runner         *codex.Runner
+	reloadMessages func(context.Context, storage.Snapshot) error
 	startupConfig  appconfig.Config
 
 	mu              sync.Mutex
 	sessions        map[string]session
-	failures        map[string][]time.Time
 	sessionsChanged chan struct{}
 
 	configMu       sync.RWMutex
@@ -91,7 +92,6 @@ type Server struct {
 
 type session struct {
 	Username  string
-	CSRFToken string
 	ExpiresAt time.Time
 }
 
@@ -108,7 +108,6 @@ type actionRequest struct {
 type sessionResponse struct {
 	Authenticated bool      `json:"authenticated"`
 	Username      string    `json:"username"`
-	CSRFToken     string    `json:"csrf_token"`
 	ExpiresAt     time.Time `json:"expires_at"`
 }
 
@@ -183,8 +182,8 @@ func New(options Options) (*Server, error) {
 		assets:          options.Assets,
 		configStore:     options.ConfigStore,
 		runner:          options.Runner,
+		reloadMessages:  options.ReloadMessages,
 		sessions:        make(map[string]session),
-		failures:        make(map[string][]time.Time),
 		sessionsChanged: make(chan struct{}),
 		configChanged:   make(chan struct{}),
 	}
@@ -226,19 +225,19 @@ func (s *Server) routes() {
 	authorized := api.Group("")
 	authorized.Use(s.requireSession())
 	authorized.GET("/auth/session", s.getSession)
-	authorized.POST("/auth/logout", s.requireCSRF(), s.logout)
+	authorized.POST("/auth/logout", s.logout)
 	authorized.GET("/dashboard", s.dashboard)
-	authorized.POST("/actions", s.requireCSRF(), s.actions)
+	authorized.POST("/actions", s.actions)
 	authorized.GET("/events", s.events)
 	authorized.GET("/config", s.getConfig)
-	authorized.PUT("/config/codex", s.requireCSRF(), s.updateCodexConfig)
-	authorized.PUT("/config/openilink", s.requireCSRF(), s.updateOpenILinkConfig)
-	authorized.PUT("/config/telegram", s.requireCSRF(), s.updateTelegramConfig)
-	authorized.PUT("/config/web", s.requireCSRF(), s.updateWebConfig)
-	authorized.PUT("/account", s.requireCSRF(), s.updateAccount)
-	authorized.POST("/targets", s.requireCSRF(), s.createTarget)
-	authorized.PUT("/targets/:id", s.requireCSRF(), s.updateTarget)
-	authorized.DELETE("/targets/:id", s.requireCSRF(), s.deleteTarget)
+	authorized.PUT("/config/codex", s.updateCodexConfig)
+	authorized.PUT("/config/openilink", s.updateOpenILinkConfig)
+	authorized.PUT("/config/telegram", s.updateTelegramConfig)
+	authorized.PUT("/config/web", s.updateWebConfig)
+	authorized.PUT("/account", s.updateAccount)
+	authorized.POST("/targets", s.createTarget)
+	authorized.PUT("/targets/:id", s.updateTarget)
+	authorized.DELETE("/targets/:id", s.deleteTarget)
 
 	s.engine.NoRoute(s.serveUI)
 }
@@ -254,14 +253,8 @@ func (s *Server) securityHeaders() gin.HandlerFunc {
 }
 
 func (s *Server) login(c *gin.Context) {
-	clientIP := c.ClientIP()
-	if s.loginBlocked(clientIP) {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "用户名或密码错误"})
-		return
-	}
 	var request loginRequest
 	if err := decodeJSON(c, &request); err != nil {
-		s.recordLoginFailure(clientIP)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名或密码错误"})
 		return
 	}
@@ -284,7 +277,6 @@ func (s *Server) login(c *gin.Context) {
 		authenticated = usernameOK && passwordOK
 	}
 	if !authenticated {
-		s.recordLoginFailure(clientIP)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
@@ -303,9 +295,6 @@ func (s *Server) login(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "暂时无法登录"})
 		return
 	}
-	s.mu.Lock()
-	delete(s.failures, clientIP)
-	s.mu.Unlock()
 	c.JSON(http.StatusOK, makeSessionResponse(current))
 }
 
@@ -325,8 +314,8 @@ func (s *Server) logout(c *gin.Context) {
 }
 
 func (s *Server) dashboard(c *gin.Context) {
-	snapshot, activities := s.manager.DashboardSnapshot()
-	c.JSON(http.StatusOK, s.dashboardPayload(snapshot, activities, s.status.Snapshot(), s.telegramStatus.Snapshot()))
+	snapshot := s.manager.ComprehensiveSnapshot()
+	c.JSON(http.StatusOK, s.dashboardPayload(snapshot, s.status.Snapshot(), s.telegramStatus.Snapshot()))
 }
 
 func (s *Server) actions(c *gin.Context) {
@@ -347,21 +336,16 @@ func (s *Server) actions(c *gin.Context) {
 			return
 		}
 	}
-	current, _ := c.Get("session")
-	operation := jobs.Operation{Source: jobs.SourceWeb, Actor: current.(session).Username}
 	response := actionResponse{}
 	switch request.Action {
 	case "queue.start":
-		result := s.manager.StartWithOperation(request.Targets, jobs.Subscriber{}, operation)
+		result := s.manager.Start(request.Targets, jobs.Subscriber{})
 		response = actionResponse{Changed: result.Started, Unchanged: result.Already, Unknown: result.Unknown}
-	case "queue.stop":
-		result := s.manager.StopWithOperation(request.Targets, operation)
-		response = actionResponse{Changed: result.Stopped, Unchanged: result.Inactive, Unknown: result.Unknown}
 	case "keepalive.start":
-		result := s.manager.StartKeepaliveWithOperation(request.Targets, operation)
+		result := s.manager.StartKeepalive(request.Targets)
 		response = actionResponse{Changed: result.Started, Unchanged: result.Already, Unknown: result.Unknown}
-	case "keepalive.stop":
-		result := s.manager.StopKeepaliveWithOperation(request.Targets, operation)
+	case "task.stop", "queue.stop", "keepalive.stop":
+		result := s.manager.StopTask(request.Targets)
 		response = actionResponse{Changed: result.Stopped, Unchanged: result.Inactive, Unknown: result.Unknown}
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的操作"})
@@ -399,43 +383,6 @@ func (s *Server) requireSession() gin.HandlerFunc {
 	}
 }
 
-func (s *Server) requireCSRF() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		current, exists := c.Get("session")
-		provided := c.GetHeader(csrfHeaderName)
-		if !exists || provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(current.(session).CSRFToken)) != 1 {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "CSRF 校验失败"})
-			return
-		}
-		c.Next()
-	}
-}
-
-func (s *Server) loginBlocked(clientIP string) bool {
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.failures[clientIP] = recentFailures(s.failures[clientIP], now)
-	return len(s.failures[clientIP]) >= loginFailureLimit
-}
-
-func (s *Server) recordLoginFailure(clientIP string) {
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	recent := recentFailures(s.failures[clientIP], now)
-	s.failures[clientIP] = append(recent, now)
-}
-
-func recentFailures(values []time.Time, now time.Time) []time.Time {
-	cutoff := now.Add(-loginWindow)
-	first := 0
-	for first < len(values) && values[first].Before(cutoff) {
-		first++
-	}
-	return append([]time.Time(nil), values[first:]...)
-}
-
 func (s *Server) purgeExpiredSessionsLocked(now time.Time) {
 	for id, current := range s.sessions {
 		if !current.ExpiresAt.After(now) {
@@ -461,12 +408,8 @@ func (s *Server) establishSession(c *gin.Context, username string) (session, err
 	if err != nil {
 		return session{}, err
 	}
-	csrfToken, err := randomToken()
-	if err != nil {
-		return session{}, err
-	}
 	now := s.now()
-	current := session{Username: username, CSRFToken: csrfToken, ExpiresAt: now.Add(s.sessionTTL)}
+	current := session{Username: username, ExpiresAt: now.Add(s.sessionTTL)}
 	s.mu.Lock()
 	s.sessions[sessionID] = current
 	s.purgeExpiredSessionsLocked(now)
@@ -505,7 +448,6 @@ func makeSessionResponse(current session) sessionResponse {
 	return sessionResponse{
 		Authenticated: true,
 		Username:      current.Username,
-		CSRFToken:     current.CSRFToken,
 		ExpiresAt:     current.ExpiresAt,
 	}
 }

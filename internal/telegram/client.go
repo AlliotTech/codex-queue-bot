@@ -11,9 +11,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-queue-bot/internal/hub"
+	"codex-queue-bot/internal/proxyenv"
 )
 
 const maxResponseSize = 1 << 20
@@ -27,6 +29,8 @@ type Client struct {
 	httpClient  *http.Client
 	logger      *slog.Logger
 	status      *hub.StatusStore
+	runMu       sync.Mutex
+	runCancel   context.CancelFunc
 }
 
 type apiResponse[T any] struct {
@@ -57,12 +61,19 @@ type chat struct {
 	ID int64 `json:"id"`
 }
 
-func New(baseURL, token string, timeout, pollTimeout time.Duration, logger *slog.Logger) *Client {
+func New(baseURL, token string, timeout, pollTimeout time.Duration, logger *slog.Logger, resolvers ...*proxyenv.Resolver) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var resolver *proxyenv.Resolver
+	if len(resolvers) > 0 {
+		resolver = resolvers[0]
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = http.ProxyFromEnvironment
+	transport.Proxy = nil
+	if resolver != nil {
+		transport = resolver.HTTPTransport(transport)
+	}
 	return &Client{
 		baseURL:     strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		token:       strings.TrimSpace(token),
@@ -73,9 +84,24 @@ func New(baseURL, token string, timeout, pollTimeout time.Duration, logger *slog
 	}
 }
 
+func NewWithProxy(baseURL, token string, timeout, pollTimeout time.Duration, logger *slog.Logger, resolver *proxyenv.Resolver) *Client {
+	return New(baseURL, token, timeout, pollTimeout, logger, resolver)
+}
+
 func (c *Client) StatusStore() *hub.StatusStore { return c.status }
 
 func (c *Client) Run(ctx context.Context, handler func(context.Context, hub.Incoming)) error {
+	adapterCtx, cancel := context.WithCancel(ctx)
+	c.runMu.Lock()
+	c.runCancel = cancel
+	c.runMu.Unlock()
+	defer func() {
+		cancel()
+		c.runMu.Lock()
+		c.runCancel = nil
+		c.runMu.Unlock()
+	}()
+	ctx = adapterCtx
 	c.status.Set(hub.StatusConnecting, "")
 	var offset int64
 	backoff := time.Second
@@ -125,11 +151,26 @@ func (c *Client) Run(ctx context.Context, handler func(context.Context, hub.Inco
 	}
 }
 
+// Close interrupts a long poll immediately so a replacement client can be
+// started without waiting for the configured poll timeout.
+func (c *Client) Close() {
+	c.runMu.Lock()
+	cancel := c.runCancel
+	c.runMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (c *Client) Send(ctx context.Context, to, content, _ string) error {
 	values := url.Values{}
 	values.Set("chat_id", strings.TrimSpace(to))
 	values.Set("text", content)
 	_, err := call[json.RawMessage](c, ctx, "sendMessage", values)
+	if errors.Is(err, ErrUnauthorized) {
+		c.status.Set(hub.StatusUnauthorized, ErrUnauthorized.Error())
+		c.Close()
+	}
 	return err
 }
 

@@ -17,7 +17,6 @@ type dashboardResponse struct {
 	Telegram        openILinkResponse   `json:"telegram"`
 	Concurrency     concurrencyResponse `json:"concurrency"`
 	Targets         []targetResponse    `json:"targets"`
-	Activities      []activityResponse  `json:"activities"`
 }
 
 type stateResponse struct {
@@ -75,29 +74,13 @@ type keepaliveResponse struct {
 	LastError   string              `json:"last_error,omitempty"`
 }
 
-type activityResponse struct {
-	ID       uint64      `json:"id"`
-	Type     string      `json:"type"`
-	Target   string      `json:"target"`
-	Source   jobs.Source `json:"source"`
-	Actor    string      `json:"actor"`
-	Attempts int         `json:"attempts"`
-	At       time.Time   `json:"at"`
-	Error    string      `json:"error,omitempty"`
-}
-
-func (s *Server) dashboardPayload(snapshot jobs.ManagerSnapshot, activities []jobs.Activity, openILinkStatus, telegramStatus hub.StatusSnapshot) dashboardResponse {
+func (s *Server) dashboardPayload(snapshot jobs.ManagerSnapshot, openILinkStatus, telegramStatus hub.StatusSnapshot) dashboardResponse {
 	state := s.statePayload(snapshot, openILinkStatus, telegramStatus)
-	result := dashboardResponse{
+	return dashboardResponse{
 		Version: state.Version, GeneratedAt: state.GeneratedAt,
 		ConfigRevision: state.ConfigRevision, RestartRequired: state.RestartRequired, RestartFields: state.RestartFields,
 		OpenILink: state.OpenILink, Telegram: state.Telegram, Concurrency: state.Concurrency, Targets: state.Targets,
-		Activities: make([]activityResponse, 0, len(activities)),
 	}
-	for _, activity := range activities {
-		result.Activities = append(result.Activities, makeActivityResponse(activity))
-	}
-	return result
 }
 
 func (s *Server) statePayload(snapshot jobs.ManagerSnapshot, openILinkStatus, telegramStatus hub.StatusSnapshot) stateResponse {
@@ -149,19 +132,6 @@ func (s *Server) statePayload(snapshot jobs.ManagerSnapshot, openILinkStatus, te
 		})
 	}
 	return result
-}
-
-func makeActivityResponse(activity jobs.Activity) activityResponse {
-	return activityResponse{
-		ID:       activity.ID,
-		Type:     activity.Type,
-		Target:   activity.Target,
-		Source:   activity.Source,
-		Actor:    activity.Actor,
-		Attempts: activity.Attempts,
-		At:       activity.At,
-		Error:    activity.Error,
-	}
 }
 
 func timePointer(value time.Time) *time.Time {

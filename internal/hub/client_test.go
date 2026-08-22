@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"codex-queue-bot/internal/proxyenv"
 
 	"github.com/gorilla/websocket"
 )
@@ -39,17 +45,114 @@ func TestClientSend(t *testing.T) {
 	}
 }
 
-func TestClientConfiguresProxyAwareHTTPAndWebSocketTransports(t *testing.T) {
+func TestClientSendUsesInjectedHTTPProxy(t *testing.T) {
+	var proxyCalls atomic.Int32
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		if r.URL.Host != "hub.invalid" || r.URL.Path != "/bot/v1/message/send" {
+			t.Errorf("proxy request URL = %s", r.URL.String())
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer proxyServer.Close()
+	resolver, err := proxyenv.Resolve([]string{"HTTP_PROXY=" + proxyServer.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := New("http://hub.invalid", "token", time.Second, nil, resolver)
+	if err := client.Send(context.Background(), "user", "ok", ""); err != nil {
+		t.Fatal(err)
+	}
+	if proxyCalls.Load() != 1 {
+		t.Fatalf("proxy calls = %d", proxyCalls.Load())
+	}
+}
+
+func TestClientWebSocketProxyUsesSameResolver(t *testing.T) {
+	resolver, err := proxyenv.Resolve([]string{"ALL_PROXY=socks5h://proxy.example:1080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := New("https://hub.example", "token", time.Second, nil, resolver)
+	request, _ := url.Parse("wss://hub.example/bot/v1/ws")
+	got, err := resolver.WebSocketProxy(request)
+	if err != nil || got == nil || got.Scheme != "socks5" || got.Host != "proxy.example:1080" {
+		t.Fatalf("WebSocket proxy = %v, %v", got, err)
+	}
+	if client.dialer.Proxy != nil || client.dialer.NetDialContext == nil {
+		t.Fatal("WebSocket dialer did not receive the shared resolver")
+	}
+}
+
+func TestClientWithoutResolverDoesNotReadProxyEnvironment(t *testing.T) {
 	client := New("https://hub.example.com", "app-token", time.Second, nil)
 	transport, ok := client.httpClient.Transport.(*http.Transport)
-	if !ok || transport.Proxy == nil {
-		t.Fatalf("HTTP transport is not proxy-aware: %#v", client.httpClient.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Fatalf("HTTP transport unexpectedly reads proxy environment: %#v", client.httpClient.Transport)
 	}
 	if client.dialer == websocket.DefaultDialer {
 		t.Fatal("client must not mutate or reuse the global WebSocket dialer")
 	}
-	if client.dialer.Proxy == nil {
-		t.Fatal("WebSocket dialer is not proxy-aware")
+	if client.dialer.Proxy != nil {
+		t.Fatal("WebSocket dialer unexpectedly reads proxy environment")
+	}
+}
+
+func TestClientWebSocketActuallyUsesInjectedHTTPProxy(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteJSON(map[string]string{"type": "init"})
+		<-r.Context().Done()
+	}))
+	defer target.Close()
+	_, targetPort, err := net.SplitHostPort(target.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetURL := "http://hub-proxy-test.invalid:" + targetPort
+
+	var proxyCalls atomic.Int32
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", target.Listener.Addr().String())
+		if err != nil {
+			http.Error(w, "dial failed", http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		downstream, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer downstream.Close()
+		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buffered.Flush()
+		go func() { _, _ = io.Copy(upstream, downstream) }()
+		_, _ = io.Copy(downstream, upstream)
+	}))
+	defer proxyServer.Close()
+
+	resolver, err := proxyenv.Resolve([]string{"HTTP_PROXY=" + proxyServer.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := New(targetURL, "token", time.Second, nil, resolver)
+	conn, err := client.connect(context.Background())
+	if err != nil {
+		t.Fatalf("connect through proxy: %v", err)
+	}
+	_ = conn.Close()
+	if proxyCalls.Load() != 1 {
+		t.Fatalf("proxy calls = %d, want 1", proxyCalls.Load())
 	}
 }
 

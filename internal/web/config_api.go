@@ -28,6 +28,7 @@ type setupRequest struct {
 type codexConfigRequest struct {
 	Binary               string   `json:"binary"`
 	PromptsFile          string   `json:"prompts_file"`
+	Prompts              []string `json:"prompts"`
 	RequestTimeoutSecond int      `json:"request_timeout_seconds"`
 	RetryMinSecond       int      `json:"retry_min_seconds"`
 	RetryMaxSecond       int      `json:"retry_max_seconds"`
@@ -98,6 +99,7 @@ type configurationResponse struct {
 type codexConfigurationResponse struct {
 	Binary               string   `json:"binary"`
 	PromptsFile          string   `json:"prompts_file"`
+	Prompts              []string `json:"prompts"`
 	RequestTimeoutSecond int      `json:"request_timeout_seconds"`
 	RetryMinSecond       int      `json:"retry_min_seconds"`
 	RetryMaxSecond       int      `json:"retry_max_seconds"`
@@ -213,7 +215,7 @@ func (s *Server) updateCodexConfig(c *gin.Context) {
 		return
 	}
 	value := config.CodexConfig{
-		Binary: request.Binary, PromptsFile: request.PromptsFile,
+		Binary: request.Binary, PromptsFile: request.PromptsFile, Prompts: cleanStrings(request.Prompts), PromptsPersisted: true,
 		RequestTimeoutSecond: request.RequestTimeoutSecond,
 		RetryMinSecond:       request.RetryMinSecond, RetryMaxSecond: request.RetryMaxSecond,
 		KeepaliveMinSecond: request.KeepaliveMinSecond, KeepaliveMaxSecond: request.KeepaliveMaxSecond,
@@ -281,6 +283,11 @@ func (s *Server) updateOpenILinkConfig(c *gin.Context) {
 		s.writeConfigurationError(c, err)
 		return
 	}
+	if s.reloadMessages != nil {
+		if reloadErr := s.reloadMessages(c.Request.Context(), snapshot); reloadErr != nil {
+			s.logger.Error("failed to reload OpenILink client", "error", reloadErr)
+		}
+	}
 	s.setConfiguration(snapshot)
 	c.JSON(http.StatusOK, s.configurationPayload(snapshot))
 }
@@ -330,6 +337,11 @@ func (s *Server) updateTelegramConfig(c *gin.Context) {
 	if err != nil {
 		s.writeConfigurationError(c, err)
 		return
+	}
+	if s.reloadMessages != nil {
+		if reloadErr := s.reloadMessages(c.Request.Context(), snapshot); reloadErr != nil {
+			s.logger.Error("failed to reload Telegram client", "error", reloadErr)
+		}
 	}
 	s.setConfiguration(snapshot)
 	c.JSON(http.StatusOK, s.configurationPayload(snapshot))
@@ -570,7 +582,7 @@ func (s *Server) requireConfigStore(c *gin.Context) bool {
 func (s *Server) writeTargetError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, jobs.ErrTargetBusy):
-		c.JSON(http.StatusConflict, gin.H{"error": "运行中的 target 不能编辑或删除"})
+		c.JSON(http.StatusConflict, gin.H{"error": "target 任务未能在 10 秒内停止，未保存修改"})
 	case errors.Is(err, jobs.ErrTargetNotFound), errors.Is(err, storage.ErrNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "target 不存在"})
 	case errors.Is(err, jobs.ErrTargetConflict), errors.Is(err, storage.ErrConflict):
@@ -600,11 +612,12 @@ func (s *Server) writeConfigurationError(c *gin.Context, err error) {
 func (s *Server) applyRuntimeConfiguration(snapshot storage.Snapshot) {
 	cfg := snapshot.Config
 	if s.runner != nil {
+		s.runner.UpdatePaths(cfg.Codex.Binary, cfg.Codex.PromptsFile, cfg.Codex.Prompts, cfg.Codex.PromptsPersisted)
 		s.runner.UpdateRuntime(cfg.RequestTimeout(), cfg.Codex.ReasoningEffort, cfg.Codex.ConfigOverrides)
 	}
 	s.manager.UpdateSettings(
 		cfg.RetryMin(), cfg.RetryMax(), cfg.KeepaliveMin(), cfg.KeepaliveMax(),
-		cfg.Codex.MaxParallel, cfg.Codex.SuccessMessage, cfg.Web.ActivityLimit,
+		cfg.Codex.MaxParallel, cfg.Codex.SuccessMessage,
 	)
 }
 
@@ -634,7 +647,7 @@ func (s *Server) configurationPayload(snapshot storage.Snapshot) configurationRe
 		Revision: snapshot.Revision, LoadedStartupRevision: snapshot.LoadedStartupRevision,
 		RestartRequired: len(fields) > 0, RestartFields: fields,
 		Codex: codexConfigurationResponse{
-			Binary: snapshot.Config.Codex.Binary, PromptsFile: snapshot.Config.Codex.PromptsFile,
+			Binary: snapshot.Config.Codex.Binary, PromptsFile: snapshot.Config.Codex.PromptsFile, Prompts: nonNilStrings(snapshot.Config.Codex.Prompts),
 			RequestTimeoutSecond: snapshot.Config.Codex.RequestTimeoutSecond,
 			RetryMinSecond:       snapshot.Config.Codex.RetryMinSecond, RetryMaxSecond: snapshot.Config.Codex.RetryMaxSecond,
 			KeepaliveMinSecond: snapshot.Config.Codex.KeepaliveMinSecond, KeepaliveMaxSecond: snapshot.Config.Codex.KeepaliveMaxSecond,
@@ -677,46 +690,7 @@ func (s *Server) restartFields(current config.Config) []string {
 		return []string{}
 	}
 	startup := s.startupConfig
-	fields := make([]string, 0, 10)
-	if current.Codex.Binary != startup.Codex.Binary {
-		fields = append(fields, "codex.binary")
-	}
-	if current.Codex.PromptsFile != startup.Codex.PromptsFile {
-		fields = append(fields, "codex.prompts_file")
-	}
-	if current.OpenILink.Enabled != startup.OpenILink.Enabled {
-		fields = append(fields, "openilink.enabled")
-	}
-	if current.OpenILink.BaseURL != startup.OpenILink.BaseURL {
-		fields = append(fields, "openilink.base_url")
-	}
-	if current.OpenILink.Token != startup.OpenILink.Token {
-		fields = append(fields, "openilink.token")
-	}
-	if !slices.Equal(current.OpenILink.AllowedUserIDs, startup.OpenILink.AllowedUserIDs) {
-		fields = append(fields, "openilink.allowed_user_ids")
-	}
-	if current.OpenILink.HTTPTimeoutSecond != startup.OpenILink.HTTPTimeoutSecond {
-		fields = append(fields, "openilink.http_timeout_seconds")
-	}
-	if current.Telegram.Enabled != startup.Telegram.Enabled {
-		fields = append(fields, "telegram.enabled")
-	}
-	if current.Telegram.BaseURL != startup.Telegram.BaseURL {
-		fields = append(fields, "telegram.base_url")
-	}
-	if current.Telegram.Token != startup.Telegram.Token {
-		fields = append(fields, "telegram.token")
-	}
-	if !slices.Equal(current.Telegram.AllowedUserIDs, startup.Telegram.AllowedUserIDs) {
-		fields = append(fields, "telegram.allowed_user_ids")
-	}
-	if current.Telegram.HTTPTimeoutSecond != startup.Telegram.HTTPTimeoutSecond {
-		fields = append(fields, "telegram.http_timeout_seconds")
-	}
-	if current.Telegram.PollTimeoutSecond != startup.Telegram.PollTimeoutSecond {
-		fields = append(fields, "telegram.poll_timeout_seconds")
-	}
+	fields := make([]string, 0, 3)
 	if current.Web.ListenAddress != startup.Web.ListenAddress {
 		fields = append(fields, "web.listen_address")
 	}

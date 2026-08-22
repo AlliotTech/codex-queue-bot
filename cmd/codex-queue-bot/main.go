@@ -15,12 +15,10 @@ import (
 	"time"
 
 	"codex-queue-bot/internal/codex"
-	"codex-queue-bot/internal/commands"
 	"codex-queue-bot/internal/hub"
 	"codex-queue-bot/internal/jobs"
 	"codex-queue-bot/internal/proxyenv"
 	"codex-queue-bot/internal/storage"
-	"codex-queue-bot/internal/telegram"
 	"codex-queue-bot/internal/web"
 )
 
@@ -31,7 +29,7 @@ func main() {
 	if configDefault == "" {
 		configDefault = "config.json"
 	}
-	configPath := flag.String("config", configDefault, "path to JSON configuration")
+	configPath := flag.String("config", configDefault, "deprecated (configuration is stored in SQLite)")
 	dbDefault := os.Getenv("CODEX_QUEUE_DB_PATH")
 	if dbDefault == "" {
 		dbDefault = "data/codex-queue-bot.db"
@@ -40,6 +38,7 @@ func main() {
 	checkOnly := flag.Bool("check", false, "validate configuration, Codex executable, and prompts, then exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	_ = configPath // retained only so old launch scripts continue to parse.
 
 	if *showVersion {
 		fmt.Println(version)
@@ -49,6 +48,11 @@ func main() {
 	logger := newLogger(os.Getenv("LOG_LEVEL"))
 	slog.SetDefault(logger)
 	proxyConfig := proxyenv.Apply()
+	proxyResolver, proxyErr := proxyenv.Resolve(os.Environ())
+	if proxyErr != nil {
+		logger.Error("invalid outbound proxy configuration", "error", proxyErr)
+		os.Exit(2)
+	}
 	if proxyConfig.Enabled() {
 		logger.Info(
 			"outbound proxy enabled",
@@ -59,9 +63,8 @@ func main() {
 		)
 	}
 	configStore, err := storage.Open(context.Background(), storage.Options{
-		Path:             *dbPath,
-		MasterKeyBase64:  os.Getenv("CODEX_QUEUE_MASTER_KEY"),
-		LegacyConfigPath: *configPath,
+		Path:            *dbPath,
+		MasterKeyBase64: os.Getenv("CODEX_QUEUE_MASTER_KEY"),
 	})
 	if err != nil {
 		logger.Error("configuration database error", "error", err)
@@ -76,12 +79,15 @@ func main() {
 	cfg := &snapshot.Config
 
 	runner := &codex.Runner{
-		Binary:          cfg.Codex.Binary,
-		PromptsFile:     cfg.Codex.PromptsFile,
-		Timeout:         cfg.RequestTimeout(),
-		ReasoningEffort: cfg.Codex.ReasoningEffort,
-		Overrides:       cfg.Codex.ConfigOverrides,
-		Logger:          logger,
+		Binary:           cfg.Codex.Binary,
+		PromptsFile:      cfg.Codex.PromptsFile,
+		Prompts:          append([]string(nil), cfg.Codex.Prompts...),
+		PromptsPersisted: cfg.Codex.PromptsPersisted,
+		Timeout:          cfg.RequestTimeout(),
+		ReasoningEffort:  cfg.Codex.ReasoningEffort,
+		Overrides:        cfg.Codex.ConfigOverrides,
+		Logger:           logger,
+		Proxy:            proxyResolver,
 	}
 	if len(cfg.Codex.Targets) > 0 || *checkOnly {
 		if err := runner.Check(); err != nil {
@@ -106,16 +112,6 @@ func main() {
 
 	statusStore := hub.NewStatusStore(hub.StatusDisabled)
 	telegramStatusStore := hub.NewStatusStore(hub.StatusDisabled)
-	var hubClient *hub.Client
-	if cfg.OpenILinkEnabled() {
-		hubClient = hub.New(cfg.OpenILink.BaseURL, cfg.OpenILink.Token, cfg.HTTPTimeout(), logger)
-		statusStore = hubClient.StatusStore()
-	}
-	var telegramClient *telegram.Client
-	if cfg.TelegramEnabled() {
-		telegramClient = telegram.New(cfg.Telegram.BaseURL, cfg.Telegram.Token, cfg.TelegramHTTPTimeout(), cfg.TelegramPollTimeout(), logger)
-		telegramStatusStore = telegramClient.StatusStore()
-	}
 	manager := jobs.New(
 		ctx,
 		cfg.Codex.Targets,
@@ -128,8 +124,13 @@ func main() {
 		cfg.KeepaliveMax(),
 		cfg.Codex.MaxParallel,
 		cfg.Codex.SuccessMessage,
-		cfg.Web.ActivityLimit,
 	)
+	messageRuntime := newMessageRuntime(ctx, manager, proxyResolver, logger, statusStore, telegramStatusStore)
+	manager.SetMessenger(messageRuntime.DefaultMessenger())
+	if err := messageRuntime.Reload(snapshot); err != nil {
+		logger.Error("message adapter configuration error", "error", err)
+		os.Exit(2)
+	}
 
 	webServer, err := web.New(web.Options{
 		Manager:         manager,
@@ -143,6 +144,7 @@ func main() {
 		ConfigStore:     configStore,
 		InitialConfig:   snapshot,
 		Runner:          runner,
+		ReloadMessages:  func(_ context.Context, next storage.Snapshot) error { return messageRuntime.Reload(next) },
 	})
 	if err != nil {
 		logger.Error("web server configuration error", "error", err)
@@ -162,31 +164,6 @@ func main() {
 	go func() {
 		serveErrors <- httpServer.Serve(listener)
 	}()
-
-	if hubClient != nil {
-		handler := commands.New(manager, hubClient, logger, cfg.OpenILink.AllowedUserIDs)
-		go func() {
-			if err := hubClient.Run(ctx, handler.Handle); err != nil {
-				if errors.Is(err, hub.ErrUnauthorized) {
-					logger.Error("OpenILink authentication failed; Web console remains available", "error", err)
-				} else if ctx.Err() == nil {
-					logger.Error("OpenILink listener stopped; Web console remains available", "error", err)
-				}
-			}
-		}()
-	}
-	if telegramClient != nil {
-		handler := commands.NewAdapter(manager, telegramClient, logger, cfg.Telegram.AllowedUserIDs, jobs.SourceTelegram, "Telegram")
-		go func() {
-			if err := telegramClient.Run(ctx, handler.Handle); err != nil {
-				if errors.Is(err, telegram.ErrUnauthorized) {
-					logger.Error("Telegram authentication failed; Web console remains available", "error", err)
-				} else if ctx.Err() == nil {
-					logger.Error("Telegram listener stopped; Web console remains available", "error", err)
-				}
-			}
-		}()
-	}
 
 	logger.Info(
 		"Codex Web console started",
@@ -212,6 +189,7 @@ func main() {
 		stop()
 	}
 	manager.BeginShutdown()
+	messageRuntime.Close()
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()

@@ -30,21 +30,26 @@ const (
 )
 
 type Runner struct {
-	mu              sync.RWMutex
-	Binary          string
-	PromptsFile     string
-	Timeout         time.Duration
-	ReasoningEffort string
-	Overrides       []string
-	Logger          *slog.Logger
+	mu               sync.RWMutex
+	Binary           string
+	PromptsFile      string
+	Prompts          []string
+	PromptsPersisted bool
+	Timeout          time.Duration
+	ReasoningEffort  string
+	Overrides        []string
+	Logger           *slog.Logger
+	Proxy            *proxyenv.Resolver
 }
 
 type runnerSettings struct {
-	Binary          string
-	PromptsFile     string
-	Timeout         time.Duration
-	ReasoningEffort string
-	Overrides       []string
+	Binary           string
+	PromptsFile      string
+	Prompts          []string
+	PromptsPersisted bool
+	Timeout          time.Duration
+	ReasoningEffort  string
+	Overrides        []string
 }
 
 type Result struct {
@@ -69,8 +74,19 @@ func (r *Runner) Check() error {
 	r.mu.Lock()
 	r.Binary = resolved
 	r.mu.Unlock()
-	if _, err := readPrompts(settings.PromptsFile); err != nil {
-		return err
+	if !settings.PromptsPersisted {
+		if _, err := readPrompts(settings.PromptsFile); err != nil {
+			return err
+		}
+	} else {
+		if len(settings.Prompts) == 0 {
+			return errors.New("configured prompt list is empty")
+		}
+		for _, prompt := range settings.Prompts {
+			if strings.TrimSpace(prompt) == "" {
+				return errors.New("configured prompt list contains an empty prompt")
+			}
+		}
 	}
 	return nil
 }
@@ -80,7 +96,7 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 	result := Result{}
 	settings := r.snapshot()
 
-	prompt, err := pickPrompt(settings.PromptsFile)
+	prompt, err := pickPromptFromSettings(settings)
 	if err != nil {
 		result.Error = err.Error()
 		result.Duration = time.Since(started)
@@ -113,7 +129,7 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 	defer cancel()
 	cmd := exec.Command(settings.Binary, args...)
 	cmd.Dir = workspace
-	cmd.Env = codexEnvironment(os.Environ(), target.APIKey)
+	cmd.Env = r.codexEnvironment(os.Environ(), target.APIKey)
 
 	output := newTailBuffer(maxOutputLen)
 	cmd.Stdout = output
@@ -158,6 +174,16 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 	result.Success = true
 	result.Duration = time.Since(started)
 	return result
+}
+
+func (r *Runner) codexEnvironment(base []string, apiKey string) []string {
+	r.mu.RLock()
+	resolver := r.Proxy
+	r.mu.RUnlock()
+	if resolver != nil {
+		base = resolver.NormalizeEnvironment(base)
+	}
+	return codexEnvironment(base, apiKey)
 }
 
 func (r *Runner) args(target config.Target, workspace, responsePath, prompt string) []string {
@@ -214,16 +240,43 @@ func (r *Runner) UpdateRuntime(timeout time.Duration, reasoningEffort string, ov
 	r.Overrides = append([]string(nil), overrides...)
 }
 
+// UpdatePaths applies the persisted executable and prompt source for future
+// requests.  Existing in-flight subprocesses keep their snapshotted values.
+func (r *Runner) UpdatePaths(binary, promptsFile string, prompts []string, promptsPersisted ...bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if strings.TrimSpace(binary) != "" {
+		r.Binary = strings.TrimSpace(binary)
+	}
+	if strings.TrimSpace(promptsFile) != "" {
+		r.PromptsFile = strings.TrimSpace(promptsFile)
+	}
+	r.Prompts = append([]string(nil), prompts...)
+	r.PromptsPersisted = len(promptsPersisted) == 0 || promptsPersisted[0]
+}
+
 func (r *Runner) snapshot() runnerSettings {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return runnerSettings{
-		Binary:          r.Binary,
-		PromptsFile:     r.PromptsFile,
-		Timeout:         r.Timeout,
-		ReasoningEffort: r.ReasoningEffort,
-		Overrides:       append([]string(nil), r.Overrides...),
+		Binary:           r.Binary,
+		PromptsFile:      r.PromptsFile,
+		Prompts:          append([]string(nil), r.Prompts...),
+		PromptsPersisted: r.PromptsPersisted,
+		Timeout:          r.Timeout,
+		ReasoningEffort:  r.ReasoningEffort,
+		Overrides:        append([]string(nil), r.Overrides...),
 	}
+}
+
+func pickPromptFromSettings(settings runnerSettings) (string, error) {
+	if settings.PromptsPersisted {
+		if len(settings.Prompts) == 0 {
+			return "", errors.New("configured prompt list is empty")
+		}
+		return settings.Prompts[mathrand.Intn(len(settings.Prompts))], nil
+	}
+	return pickPrompt(settings.PromptsFile)
 }
 
 func (r *Runner) removeWorkspace(path string) {

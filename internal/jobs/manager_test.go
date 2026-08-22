@@ -72,6 +72,27 @@ func TestManagerRetriesUntilSuccessAndNotifiesSubscriber(t *testing.T) {
 	}
 }
 
+func TestQueueFailureRetriesImmediatelyWithoutNextAttemptTimer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := &immediateSequenceRunner{
+		results: []codex.Result{{Error: "queued"}, {Success: true, Response: "ok"}},
+		calls:   make(chan observedCall, 2),
+	}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
+	manager.Start(nil, Subscriber{})
+	first := receiveObservedCall(t, runner.calls)
+	second := receiveObservedCall(t, runner.calls)
+	if delay := second.at.Sub(first.at); delay > 100*time.Millisecond {
+		t.Fatalf("queue retry delay = %s, want immediate", delay)
+	}
+	snapshot, _ := manager.Snapshots(nil)
+	if !snapshot[0].NextAttempt.IsZero() {
+		t.Fatalf("queue next attempt timer = %s", snapshot[0].NextAttempt)
+	}
+}
+
 type blockingRunner struct {
 	started chan struct{}
 	once    sync.Once
@@ -314,7 +335,7 @@ func TestKeepaliveTargetsRunIndependently(t *testing.T) {
 	}
 }
 
-func TestStopKeepaliveCancelsCurrentRequestWithoutStoppingQueue(t *testing.T) {
+func TestStopKeepaliveCompatibilityStopsCurrentTask(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runner := newControlledRunner()
@@ -347,7 +368,7 @@ func TestStopKeepaliveCancelsCurrentRequestWithoutStoppingQueue(t *testing.T) {
 	}
 }
 
-func TestStopQueueDoesNotStopKeepalive(t *testing.T) {
+func TestUnifiedStopOnOneTargetDoesNotAffectOtherTargets(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runner := newControlledRunner()
@@ -387,7 +408,7 @@ func TestStopQueueDoesNotStopKeepalive(t *testing.T) {
 	}
 }
 
-func TestQueueAndKeepaliveArbitrationKeepsQueueRetriesTogether(t *testing.T) {
+func TestSwitchingFromKeepaliveToQueueCancelsOldModeBeforeStarting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runner := newControlledRunner()
@@ -396,39 +417,87 @@ func TestQueueAndKeepaliveArbitrationKeepsQueueRetriesTogether(t *testing.T) {
 
 	manager.StartKeepalive(nil)
 	keepaliveFirst := receiveControlledCall(t, runner)
-	manager.Start(nil, Subscriber{})
-	assertNoControlledCall(t, runner, 25*time.Millisecond)
-
-	keepaliveFirst.result <- codex.Result{Success: true, Response: "ok"}
+	started := make(chan StartResult, 1)
+	go func() { started <- manager.Start(nil, Subscriber{}) }()
+	select {
+	case <-keepaliveFirst.done:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive request was not cancelled during mode switch")
+	}
 	queueFirst := receiveControlledCall(t, runner)
 	if queueFirst.attempt != 1 {
 		t.Fatalf("first queue attempt = %d", queueFirst.attempt)
 	}
-	waitForCondition(t, func() bool {
-		snapshots, _ := manager.KeepaliveSnapshots(nil)
-		return snapshots[0].State == KeepaliveStateWaitingQueue
-	})
+	if result := <-started; len(result.Started) != 1 {
+		t.Fatalf("queue start result = %+v", result)
+	}
 
 	queueFirst.result <- codex.Result{Error: "still queued"}
 	queueSecond := receiveControlledCall(t, runner)
 	queueSnapshots, _ := manager.Snapshots(nil)
 	keepaliveSnapshots, _ := manager.KeepaliveSnapshots(nil)
 	if queueSnapshots[0].Attempts != 2 || keepaliveSnapshots[0].Requests != 1 {
-		t.Fatalf("keepalive inserted between queue retries: queue=%+v keepalive=%+v", queueSnapshots[0], keepaliveSnapshots[0])
+		t.Fatalf("mode switch state: queue=%+v keepalive=%+v", queueSnapshots[0], keepaliveSnapshots[0])
 	}
 	queueSecond.result <- codex.Result{Success: true, Response: "admitted"}
-
-	keepaliveSecond := receiveControlledCall(t, runner)
 	waitForCondition(t, func() bool {
 		queueState, _ := manager.Snapshots(nil)
 		keepaliveState, _ := manager.KeepaliveSnapshots(nil)
-		return queueState[0].State == StateSucceeded && keepaliveState[0].Requests == 2
+		return queueState[0].State == StateSucceeded && keepaliveState[0].State == KeepaliveStateStopped
 	})
-	manager.StopKeepalive(nil)
-	select {
-	case <-keepaliveSecond.done:
-	case <-time.After(time.Second):
-		t.Fatal("second keepalive request was not cancelled")
+}
+
+func TestConcurrentQueueAndKeepaliveStartsNeverOverlapSameTarget(t *testing.T) {
+	for iteration := 0; iteration < 50; iteration++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		runner := newControlledRunner()
+		target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+		manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Second, time.Second, time.Hour, time.Hour, 2, "ok")
+
+		start := make(chan struct{})
+		queueDone := make(chan StartResult, 1)
+		keepaliveDone := make(chan KeepaliveStartResult, 1)
+		go func() {
+			<-start
+			queueDone <- manager.Start(nil, Subscriber{})
+		}()
+		go func() {
+			<-start
+			keepaliveDone <- manager.StartKeepalive(nil)
+		}()
+		close(start)
+
+		select {
+		case <-queueDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: queue start did not return", iteration)
+		}
+		select {
+		case <-keepaliveDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: keepalive start did not return", iteration)
+		}
+
+		waitForCondition(t, func() bool { return runner.maximumActive() == 1 })
+		snapshot := manager.ComprehensiveSnapshot()
+		queueActive := snapshot.Targets[0].Queue.State == StateRunning
+		keepaliveActive := snapshot.Targets[0].Keepalive.State != KeepaliveStateStopped
+		if queueActive == keepaliveActive {
+			t.Fatalf("iteration %d: expected exactly one active mode, snapshot=%+v", iteration, snapshot.Targets[0])
+		}
+		if maximum := runner.maximumActive(); maximum != 1 {
+			t.Fatalf("iteration %d: maximum active requests = %d, want 1", iteration, maximum)
+		}
+
+		manager.StopTask(nil)
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+		if err := manager.Wait(waitCtx); err != nil {
+			waitCancel()
+			cancel()
+			t.Fatalf("iteration %d: wait for cleanup: %v", iteration, err)
+		}
+		waitCancel()
+		cancel()
 	}
 }
 
@@ -469,7 +538,7 @@ func TestComprehensiveSnapshotIncludesSharedProcessCount(t *testing.T) {
 	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
 	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Second, time.Second, time.Hour, time.Hour, 2, "开蹬")
 
-	manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
+	manager.Start(nil, Subscriber{})
 	call := receiveControlledCall(t, runner)
 	snapshot := manager.ComprehensiveSnapshot()
 	if snapshot.CurrentProcesses != 1 || snapshot.MaxParallel != 2 {
@@ -482,48 +551,23 @@ func TestComprehensiveSnapshotIncludesSharedProcessCount(t *testing.T) {
 	waitForCondition(t, func() bool { return manager.ComprehensiveSnapshot().CurrentProcesses == 0 })
 }
 
-func TestActivityLimitOrderingAndOperationMetadata(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runner := &blockingRunner{started: make(chan struct{})}
-	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
-	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬", 3)
-
-	for i := 0; i < 3; i++ {
-		manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
-		manager.StopWithOperation(nil, Operation{Source: SourceWeb, Actor: "admin"})
-	}
-	activities := manager.Activities()
-	if len(activities) != 3 {
-		t.Fatalf("activity count = %d, want 3", len(activities))
-	}
-	for i, activity := range activities {
-		if activity.Source != SourceWeb || activity.Actor != "admin" {
-			t.Fatalf("activity metadata = %+v", activity)
-		}
-		if i > 0 && activities[i-1].ID <= activity.ID {
-			t.Fatalf("activities not newest first: %+v", activities)
-		}
-	}
-}
-
-func TestObserverEventsAreOrderedAndSlowObserverIsDisconnected(t *testing.T) {
+func TestObserverReceivesOnlyStateEventsAndSlowObserverIsDisconnected(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runner := &blockingRunner{started: make(chan struct{})}
 	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
 	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬")
-	_, _, subscription := manager.Observe(1)
+	_, subscription := manager.Observe(1)
 	defer subscription.Close()
 
-	manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
+	manager.Start(nil, Subscriber{})
 	first, ok := <-subscription.Events
-	if !ok || first.Kind != EventActivity || first.Activity == nil || first.Activity.Type != "queue.start" {
+	if !ok || first.Snapshot == nil || first.Snapshot.Targets[0].Queue.State != StateRunning {
 		t.Fatalf("first observer event = %+v, ok=%v", first, ok)
 	}
-	if _, ok := <-subscription.Events; ok {
-		t.Fatal("slow observer channel should be closed after its buffer fills")
-	}
+	manager.StopTask(nil)
+	manager.Start(nil, Subscriber{})
+	waitForCondition(t, func() bool { return manager.ObserverCount() == 0 })
 }
 
 func TestWebStartDoesNotNotifyButLaterOpenILinkSubscriptionDoes(t *testing.T) {
@@ -534,9 +578,9 @@ func TestWebStartDoesNotNotifyButLaterOpenILinkSubscriptionDoes(t *testing.T) {
 	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
 	manager := New(ctx, []config.Target{target}, runner, messenger, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬")
 
-	manager.StartWithOperation(nil, Subscriber{}, Operation{Source: SourceWeb, Actor: "admin"})
+	manager.Start(nil, Subscriber{})
 	call := receiveControlledCall(t, runner)
-	result := manager.StartWithOperation(nil, Subscriber{Recipient: "user-1", TraceID: "trace-1"}, Operation{Source: SourceOpenILink, Actor: "user-1"})
+	result := manager.Start(nil, Subscriber{Recipient: "user-1", TraceID: "trace-1"})
 	if len(result.Already) != 1 {
 		t.Fatalf("subscription result = %+v", result)
 	}
@@ -565,9 +609,9 @@ func TestSubscribersCanUseDifferentMessengers(t *testing.T) {
 	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "secret", Model: "m", WireAPI: "responses"}
 	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "开蹬")
 
-	manager.StartWithOperation(nil, Subscriber{Recipient: "open-user", Key: "openilink:open-user", Messenger: openILinkMessenger}, Operation{Source: SourceOpenILink, Actor: "open-user"})
+	manager.Start(nil, Subscriber{Recipient: "open-user", Key: "openilink:open-user", Messenger: openILinkMessenger})
 	call := receiveControlledCall(t, runner)
-	manager.StartWithOperation(nil, Subscriber{Recipient: "telegram-chat", Key: "telegram:telegram-chat", Messenger: telegramMessenger}, Operation{Source: SourceTelegram, Actor: "telegram-user"})
+	manager.Start(nil, Subscriber{Recipient: "telegram-chat", Key: "telegram:telegram-chat", Messenger: telegramMessenger})
 	call.result <- codex.Result{Success: true, Response: "ok"}
 	select {
 	case message := <-openILinkMessenger.messages:
@@ -624,30 +668,7 @@ func TestBeginShutdownCancelsRunsAndWaitsForCleanup(t *testing.T) {
 	}
 }
 
-func TestIntervalUpdatesResampleWaitingQueueAndKeepaliveFromSaveTime(t *testing.T) {
-	t.Run("queue retry", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		runner := &immediateSequenceRunner{
-			results: []codex.Result{{Error: "queued"}, {Success: true, Response: "ok"}},
-			calls:   make(chan observedCall, 4),
-		}
-		target := config.Target{ID: 1, Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
-		manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
-		manager.Start(nil, Subscriber{})
-		receiveObservedCall(t, runner.calls)
-		waitForCondition(t, func() bool {
-			snapshots, _ := manager.Snapshots(nil)
-			return !snapshots[0].NextAttempt.IsZero()
-		})
-		savedAt := time.Now()
-		manager.UpdateSettings(20*time.Millisecond, 30*time.Millisecond, time.Hour, time.Hour, 1, "ok", 200)
-		second := receiveObservedCall(t, runner.calls)
-		if delay := second.at.Sub(savedAt); delay < 15*time.Millisecond || delay > 200*time.Millisecond {
-			t.Fatalf("resampled retry delay = %s", delay)
-		}
-	})
-
+func TestIntervalUpdatesOnlyResampleKeepaliveFromSaveTime(t *testing.T) {
 	t.Run("keepalive", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -704,4 +725,43 @@ func TestDynamicConcurrencyDecreaseAndIncreaseDoNotCancelRunningProcesses(t *tes
 	}
 	third.result <- codex.Result{Success: true, Response: "ok"}
 	fourth.result <- codex.Result{Success: true, Response: "ok"}
+}
+
+func TestUpdateAndDeleteStopActiveTargetBeforePersistence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	target := config.Target{ID: 1, Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
+	manager.Start(nil, Subscriber{})
+	call := receiveControlledCall(t, runner)
+	updated := target
+	updated.Name = "renamed"
+	persisted := false
+	if err := manager.UpdateTarget(1, &updated, func() error { persisted = true; return nil }); err != nil {
+		t.Fatalf("UpdateTarget: %v", err)
+	}
+	select {
+	case <-call.done:
+	default:
+		t.Fatal("active request was not stopped before update")
+	}
+	if !persisted {
+		t.Fatal("update persistence was not called")
+	}
+
+	manager.Start([]string{"renamed"}, Subscriber{})
+	call = receiveControlledCall(t, runner)
+	deleted := false
+	if err := manager.DeleteTarget(1, func() error { deleted = true; return nil }); err != nil {
+		t.Fatalf("DeleteTarget: %v", err)
+	}
+	select {
+	case <-call.done:
+	default:
+		t.Fatal("active request was not stopped before delete")
+	}
+	if !deleted || len(manager.TargetNames()) != 0 {
+		t.Fatalf("delete result: persisted=%t targets=%v", deleted, manager.TargetNames())
+	}
 }

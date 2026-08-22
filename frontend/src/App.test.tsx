@@ -27,7 +27,6 @@ const dashboard = {
   telegram: { state: "disabled", updated_at: null },
   concurrency: { current: 0, max: 2 },
   targets: [{ id: 1, name: "main", model: "gpt-test", api_host: "api.example.test", busy: false, queue: { state: "idle", attempts: 0, started_at: null, last_attempt: null, next_attempt: null, finished_at: null }, keepalive: { state: "stopped", requests: 0, started_at: null, last_request: null, last_success: null, last_failure: null, next_request: null, stopped_at: null } }],
-  activities: [],
 }
 
 const configuration = {
@@ -35,7 +34,7 @@ const configuration = {
   loaded_startup_revision: 3,
   restart_required: false,
   restart_fields: [],
-  codex: { binary: "codex", prompts_file: "prompts.txt", request_timeout_seconds: 180, retry_min_seconds: 3, retry_max_seconds: 8, keepalive_min_seconds: 2700, keepalive_max_seconds: 3300, max_parallel: 2, success_message: "开蹬", reasoning_effort: "low", config_overrides: [] },
+  codex: { binary: "codex", prompts_file: "prompts.txt", prompts: ["health check"], request_timeout_seconds: 180, retry_min_seconds: 3, retry_max_seconds: 8, keepalive_min_seconds: 2700, keepalive_max_seconds: 3300, max_parallel: 2, success_message: "开蹬", reasoning_effort: "low", config_overrides: [] },
   openilink: { enabled: false, base_url: "http://127.0.0.1:9800", token_set: false, allowed_user_ids: [], http_timeout_seconds: 15 },
   telegram: { enabled: false, base_url: "https://api.telegram.org", token_set: false, allowed_user_ids: [], http_timeout_seconds: 45, poll_timeout_seconds: 30 },
   web: { listen_address: ":8080", cookie_secure: false, trusted_proxies: [], activity_limit: 200 },
@@ -54,7 +53,7 @@ describe("console", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.endsWith("/setup/status")) return publicStatus(true)
-      if (url.endsWith("/setup")) return new Response(JSON.stringify({ authenticated: true, username: "owner", csrf_token: "csrf", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/setup")) return new Response(JSON.stringify({ authenticated: true, username: "owner", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
       if (url.endsWith("/dashboard")) return new Response(JSON.stringify({ ...dashboard, targets: [] }), { status: 200 })
       throw new Error(`unexpected request ${url}`)
     })
@@ -90,7 +89,7 @@ describe("console", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url.endsWith("/setup/status")) return publicStatus(false)
-      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", csrf_token: "csrf", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
       if (url.endsWith("/dashboard")) return new Response(JSON.stringify(dashboard), { status: 200 })
       if (url.endsWith("/actions")) return new Response(JSON.stringify({ changed: ["main"], unchanged: [], unknown: [] }), { status: 200 })
       throw new Error(`unexpected request ${url} ${init?.method}`)
@@ -98,14 +97,14 @@ describe("console", () => {
     vi.stubGlobal("fetch", fetchMock)
     render(<App />)
     expect(await screen.findByText("main")).toBeInTheDocument()
-    const batchButton = screen.getAllByRole("button", { name: /开始排队/ })[0]
+    const batchButton = screen.getAllByRole("button", { name: /开始挤队列/ })[0]
     expect(batchButton).toBeDisabled()
     fireEvent.click(screen.getByRole("checkbox", { name: "选择 main" }))
     expect(batchButton).toBeEnabled()
     fireEvent.click(batchButton)
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/v1/actions", expect.objectContaining({ method: "POST", body: JSON.stringify({ action: "queue.start", targets: ["main"] }) })))
-    MockEventSource.instances[0].emit("activity", { id: 1, type: "queue.start", target: "main", source: "web", actor: "admin", attempts: 0, at: "2026-08-20T12:00:01Z" })
-    expect(await screen.findByText(/开始排队 · web/)).toBeInTheDocument()
+    MockEventSource.instances[0].emit("state", { ...dashboard, targets: [{ ...dashboard.targets[0], busy: true, queue: { ...dashboard.targets[0].queue, state: "running", attempts: 1 } }] })
+    expect(await screen.findByText("排队中")).toBeInTheDocument()
   })
 
   it("creates a target from the configuration view without echoing a key", async () => {
@@ -115,7 +114,7 @@ describe("console", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url.endsWith("/setup/status")) return publicStatus(false)
-      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", csrf_token: "csrf", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
       if (url.endsWith("/dashboard")) return new Response(JSON.stringify(dashboard), { status: 200 })
       if (url.endsWith("/config") && !init?.method) return new Response(JSON.stringify(configuration), { status: 200 })
       if (url.endsWith("/targets") && init?.method === "POST") return new Response(JSON.stringify(created), { status: 201 })
@@ -142,11 +141,11 @@ describe("console", () => {
   it("validates random intervals and shows restart and server errors", async () => {
     MockEventSource.instances = []
     vi.stubGlobal("EventSource", MockEventSource)
-    const pendingRestart = { ...configuration, restart_required: true, restart_fields: ["codex.binary"] }
+    const pendingRestart = { ...configuration, restart_required: true, restart_fields: ["web.listen_address"] }
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url.endsWith("/setup/status")) return publicStatus(false)
-      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", csrf_token: "csrf", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
       if (url.endsWith("/dashboard")) return new Response(JSON.stringify(dashboard), { status: 200 })
       if (url.endsWith("/config") && !init?.method) return new Response(JSON.stringify(pendingRestart), { status: 200 })
       if (url.endsWith("/config/codex") && init?.method === "PUT") return new Response(JSON.stringify({ error: "服务器拒绝了配置" }), { status: 400 })
@@ -157,13 +156,13 @@ describe("console", () => {
     await screen.findByText("main")
     fireEvent.click(screen.getByRole("button", { name: "配置" }))
     expect(await screen.findByText("部分配置等待服务重启后生效")).toBeInTheDocument()
-    expect(screen.getByText("codex.binary")).toBeInTheDocument()
+    expect(screen.getByText("web.listen_address")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "任务与保活" }))
-    fireEvent.change(screen.getByLabelText("重试最小秒数"), { target: { value: "9" } })
+    fireEvent.change(screen.getByLabelText("保活最小秒数"), { target: { value: "4000" } })
     fireEvent.click(screen.getByRole("button", { name: "保存任务参数" }))
-    expect(await screen.findByRole("alert")).toHaveTextContent("重试最小秒数不能大于最大秒数")
+    expect(await screen.findByRole("alert")).toHaveTextContent("保活最小秒数不能大于最大秒数")
     expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/config/codex") && init?.method === "PUT")).toBe(false)
-    fireEvent.change(screen.getByLabelText("重试最小秒数"), { target: { value: "3" } })
+    fireEvent.change(screen.getByLabelText("保活最小秒数"), { target: { value: "2700" } })
     fireEvent.click(screen.getByRole("button", { name: "保存任务参数" }))
     expect(await screen.findByRole("alert")).toHaveTextContent("服务器拒绝了配置")
   })
@@ -175,7 +174,7 @@ describe("console", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url.endsWith("/setup/status")) return publicStatus(false)
-      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", csrf_token: "csrf", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
       if (url.endsWith("/dashboard")) return new Response(JSON.stringify(dashboard), { status: 200 })
       if (url.endsWith("/config") && !init?.method) return new Response(JSON.stringify(configuration), { status: 200 })
       if (url.endsWith("/config/telegram") && init?.method === "PUT") return new Response(JSON.stringify(saved), { status: 200 })
@@ -192,6 +191,6 @@ describe("console", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存 Telegram" }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/v1/config/telegram", expect.objectContaining({ method: "PUT" })))
     expect(screen.queryByText("telegram-secret")).not.toBeInTheDocument()
-    expect(await screen.findByText("Telegram 配置已保存，重启后生效")).toBeInTheDocument()
+    expect(await screen.findByText("Telegram 配置已保存并热重载")).toBeInTheDocument()
   })
 })

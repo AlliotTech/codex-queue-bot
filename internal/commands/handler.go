@@ -13,33 +13,34 @@ import (
 )
 
 type Handler struct {
-	manager *jobs.Manager
-	sender  jobs.Messenger
-	logger  *slog.Logger
-	allowed map[string]struct{}
-	source  jobs.Source
-	adapter string
+	manager    *jobs.Manager
+	sender     jobs.Messenger
+	logger     *slog.Logger
+	allowed    map[string]struct{}
+	adapterKey string
+	adapter    string
 }
 
 func New(manager *jobs.Manager, sender jobs.Messenger, logger *slog.Logger, allowedUserIDs []string) *Handler {
-	return NewAdapter(manager, sender, logger, allowedUserIDs, jobs.SourceOpenILink, "OpenILink")
+	return NewAdapter(manager, sender, logger, allowedUserIDs, "OpenILink")
 }
 
-func NewAdapter(manager *jobs.Manager, sender jobs.Messenger, logger *slog.Logger, allowedUserIDs []string, source jobs.Source, adapter string) *Handler {
+func NewAdapter(manager *jobs.Manager, sender jobs.Messenger, logger *slog.Logger, allowedUserIDs []string, adapter string) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	adapter = strings.TrimSpace(adapter)
 	if adapter == "" {
-		adapter = string(source)
+		adapter = "Messaging"
 	}
+	adapterKey := strings.ToLower(adapter)
 	allowed := make(map[string]struct{}, len(allowedUserIDs))
 	for _, id := range allowedUserIDs {
 		if id = strings.TrimSpace(id); id != "" {
 			allowed[id] = struct{}{}
 		}
 	}
-	return &Handler{manager: manager, sender: sender, logger: logger, allowed: allowed, source: source, adapter: adapter}
+	return &Handler{manager: manager, sender: sender, logger: logger, allowed: allowed, adapterKey: adapterKey, adapter: adapter}
 }
 
 func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
@@ -59,19 +60,19 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 	case "开挤", "go":
 		response = h.start(targets, incoming)
 	case "start":
-		if h.source == jobs.SourceTelegram && strings.TrimSpace(args) == "" {
+		if h.adapterKey == "telegram" && strings.TrimSpace(args) == "" {
 			response = helpText()
 		} else {
 			response = h.start(targets, incoming)
 		}
 	case "停止", "停挤", "stop":
-		response = h.stopFrom(targets, incoming)
+		response = h.stop(targets)
 	case "状态", "status":
 		response = h.status(targets)
 	case "保活", "keepalive":
-		response = h.startKeepaliveFrom(targets, incoming)
+		response = h.startKeepalive(targets)
 	case "停止保活", "stop-keepalive":
-		response = h.stopKeepaliveFrom(targets, incoming)
+		response = h.stopKeepalive(targets)
 	case "保活状态", "keepalive-status":
 		response = h.keepaliveStatus(targets)
 	case "列表", "目标", "list", "targets":
@@ -86,10 +87,9 @@ func (h *Handler) Handle(ctx context.Context, incoming hub.Incoming) {
 
 func (h *Handler) start(targets []string, incoming hub.Incoming) string {
 	recipient := replyRecipient(incoming)
-	result := h.manager.StartWithOperation(
+	result := h.manager.Start(
 		targets,
-		jobs.Subscriber{Recipient: recipient, TraceID: incoming.TraceID, Key: string(h.source) + ":" + recipient, Messenger: h.sender},
-		jobs.Operation{Source: h.source, Actor: incoming.SenderID},
+		jobs.Subscriber{Recipient: recipient, TraceID: incoming.TraceID, Key: h.adapterKey + ":" + recipient, Messenger: h.sender},
 	)
 	parts := make([]string, 0, 3)
 	if len(result.Started) > 0 {
@@ -107,13 +107,8 @@ func (h *Handler) start(targets []string, incoming hub.Incoming) string {
 	return strings.Join(parts, "\n")
 }
 
-func (h *Handler) stopFrom(targets []string, incoming hub.Incoming) string {
-	result := h.manager.StopWithOperation(targets, jobs.Operation{Source: h.source, Actor: incoming.SenderID})
-	return formatStopResult(result)
-}
-
 func (h *Handler) stop(targets []string) string {
-	return formatStopResult(h.manager.Stop(targets))
+	return formatStopResult(h.manager.StopTask(targets))
 }
 
 func formatStopResult(result jobs.StopResult) string {
@@ -131,11 +126,6 @@ func formatStopResult(result jobs.StopResult) string {
 		return "没有可停止的目标。"
 	}
 	return strings.Join(parts, "\n")
-}
-
-func (h *Handler) startKeepaliveFrom(targets []string, incoming hub.Incoming) string {
-	result := h.manager.StartKeepaliveWithOperation(targets, jobs.Operation{Source: h.source, Actor: incoming.SenderID})
-	return formatKeepaliveStartResult(result)
 }
 
 func (h *Handler) startKeepalive(targets []string) string {
@@ -159,30 +149,8 @@ func formatKeepaliveStartResult(result jobs.KeepaliveStartResult) string {
 	return strings.Join(parts, "\n")
 }
 
-func (h *Handler) stopKeepaliveFrom(targets []string, incoming hub.Incoming) string {
-	result := h.manager.StopKeepaliveWithOperation(targets, jobs.Operation{Source: h.source, Actor: incoming.SenderID})
-	return formatKeepaliveStopResult(result)
-}
-
 func (h *Handler) stopKeepalive(targets []string) string {
-	return formatKeepaliveStopResult(h.manager.StopKeepalive(targets))
-}
-
-func formatKeepaliveStopResult(result jobs.KeepaliveStopResult) string {
-	parts := make([]string, 0, 3)
-	if len(result.Stopped) > 0 {
-		parts = append(parts, "已停止保活："+strings.Join(result.Stopped, "、"))
-	}
-	if len(result.Inactive) > 0 {
-		parts = append(parts, "未在保活："+strings.Join(result.Inactive, "、"))
-	}
-	if len(result.Unknown) > 0 {
-		parts = append(parts, "未知目标："+strings.Join(result.Unknown, "、"))
-	}
-	if len(parts) == 0 {
-		return "没有可停止保活的目标。"
-	}
-	return strings.Join(parts, "\n")
+	return formatStopResult(h.manager.StopTask(targets))
 }
 
 func (h *Handler) status(targets []string) string {

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -63,17 +64,18 @@ type Snapshot struct {
 }
 
 type persistedCodex struct {
-	Binary               string   `json:"binary"`
-	PromptsFile          string   `json:"prompts_file"`
-	RequestTimeoutSecond int      `json:"request_timeout_seconds"`
-	RetryMinSecond       int      `json:"retry_min_seconds"`
-	RetryMaxSecond       int      `json:"retry_max_seconds"`
-	KeepaliveMinSecond   int      `json:"keepalive_min_seconds"`
-	KeepaliveMaxSecond   int      `json:"keepalive_max_seconds"`
-	MaxParallel          int      `json:"max_parallel"`
-	SuccessMessage       string   `json:"success_message"`
-	ReasoningEffort      string   `json:"reasoning_effort"`
-	ConfigOverrides      []string `json:"config_overrides"`
+	Binary               string    `json:"binary"`
+	PromptsFile          string    `json:"prompts_file"`
+	Prompts              *[]string `json:"prompts,omitempty"`
+	RequestTimeoutSecond int       `json:"request_timeout_seconds"`
+	RetryMinSecond       int       `json:"retry_min_seconds"`
+	RetryMaxSecond       int       `json:"retry_max_seconds"`
+	KeepaliveMinSecond   int       `json:"keepalive_min_seconds"`
+	KeepaliveMaxSecond   int       `json:"keepalive_max_seconds"`
+	MaxParallel          int       `json:"max_parallel"`
+	SuccessMessage       string    `json:"success_message"`
+	ReasoningEffort      string    `json:"reasoning_effort"`
+	ConfigOverrides      []string  `json:"config_overrides"`
 }
 
 type persistedOpenILink struct {
@@ -216,40 +218,6 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		}
 		cfg := config.DefaultDatabaseConfig()
 		suggestedUsername := cfg.Web.AdminUsername
-		legacyPath := strings.TrimSpace(options.LegacyConfigPath)
-		if legacyPath != "" {
-			info, statErr := os.Stat(legacyPath)
-			switch {
-			case statErr == nil && !info.IsDir():
-				legacy, loadErr := config.Load(legacyPath)
-				if loadErr != nil {
-					return cleanup(fmt.Errorf("import legacy configuration: %w", loadErr))
-				}
-				// Explicitly disabled legacy OpenILink configurations did not need
-				// their token at runtime, but the one-time migration must still
-				// resolve token_env before discarding the environment-variable name.
-				if legacy.OpenILink.Token == "" && strings.TrimSpace(legacy.OpenILink.TokenEnv) != "" {
-					envName := strings.TrimSpace(legacy.OpenILink.TokenEnv)
-					legacy.OpenILink.Token = strings.TrimSpace(os.Getenv(envName))
-					if legacy.OpenILink.Token == "" {
-						return cleanup(fmt.Errorf("import legacy configuration: openilink.token_env %q is not set", envName))
-					}
-				}
-				if legacy.Telegram.Token == "" && strings.TrimSpace(legacy.Telegram.TokenEnv) != "" {
-					envName := strings.TrimSpace(legacy.Telegram.TokenEnv)
-					legacy.Telegram.Token = strings.TrimSpace(os.Getenv(envName))
-					if legacy.Telegram.Token == "" {
-						return cleanup(fmt.Errorf("import legacy configuration: telegram.token_env %q is not set", envName))
-					}
-				}
-				cfg = *legacy
-				suggestedUsername = strings.TrimSpace(cfg.Web.AdminUsername)
-			case statErr == nil:
-				return cleanup(fmt.Errorf("legacy configuration path %q is not a file", legacyPath))
-			case !errors.Is(statErr, os.ErrNotExist):
-				return cleanup(fmt.Errorf("inspect legacy configuration: %w", statErr))
-			}
-		}
 		if suggestedUsername == "" {
 			suggestedUsername = "admin"
 		}
@@ -379,7 +347,11 @@ func (s *Store) initialize(ctx context.Context, cfg config.Config, suggestedUser
 	if err := cfg.ValidateAllowEmptyTargets(); err != nil {
 		return fmt.Errorf("validate initial database configuration: %w", err)
 	}
-	codexData, err := json.Marshal(toPersistedCodex(cfg.Codex))
+	initialCodex := toPersistedCodex(cfg.Codex)
+	// Fresh and pre-prompt-list databases intentionally omit this optional
+	// property so Load can preserve the historical prompts_file fallback.
+	initialCodex.Prompts = nil
+	codexData, err := json.Marshal(initialCodex)
 	if err != nil {
 		return err
 	}
@@ -503,6 +475,14 @@ func (s *Store) loadFrom(ctx context.Context, q queryer) (Snapshot, error) {
 	}
 
 	result.Config.Codex = fromPersistedCodex(codexRecord)
+	if codexRecord.Prompts == nil {
+		// Databases created before the prompt-list property are still valid.  A
+		// best-effort read keeps their runtime behavior identical; the first
+		// successful Codex save persists the resulting list in config_sections.
+		if prompts, promptErr := readPromptFile(result.Config.Codex.PromptsFile); promptErr == nil {
+			result.Config.Codex.Prompts = prompts
+		}
+	}
 	result.Config.OpenILink = fromPersistedOpenILink(openRecord)
 	result.Config.OpenILink.SetEnabledExplicit(openRecord.Enabled)
 	if len(tokenCipher) > 0 {
@@ -711,6 +691,10 @@ func (s *Store) UpdateCodex(ctx context.Context, value config.CodexConfig) (Snap
 	for index := range value.ConfigOverrides {
 		value.ConfigOverrides[index] = strings.TrimSpace(value.ConfigOverrides[index])
 	}
+	for index := range value.Prompts {
+		value.Prompts[index] = strings.TrimSpace(value.Prompts[index])
+	}
+	value.PromptsPersisted = true
 	value.Targets = nil
 	if err := config.ValidateCodex(value); err != nil {
 		return Snapshot{}, err
@@ -1234,6 +1218,31 @@ func nonNil(values []string) []string {
 	return values
 }
 
+func readPromptFile(path string) ([]string, error) {
+	file, err := os.Open(strings.TrimSpace(path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var prompts []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		prompts = append(prompts, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(prompts) == 0 {
+		return nil, errors.New("prompt file has no usable prompts")
+	}
+	return prompts, nil
+}
+
 func isUniqueError(err error) bool {
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "unique constraint") || strings.Contains(text, "constraint failed")
@@ -1260,8 +1269,9 @@ func protectedDirectory(path string) bool {
 }
 
 func toPersistedCodex(value config.CodexConfig) persistedCodex {
+	prompts := nonNil(value.Prompts)
 	return persistedCodex{
-		Binary: value.Binary, PromptsFile: value.PromptsFile,
+		Binary: value.Binary, PromptsFile: value.PromptsFile, Prompts: &prompts,
 		RequestTimeoutSecond: value.RequestTimeoutSecond,
 		RetryMinSecond:       value.RetryMinSecond, RetryMaxSecond: value.RetryMaxSecond,
 		KeepaliveMinSecond: value.KeepaliveMinSecond, KeepaliveMaxSecond: value.KeepaliveMaxSecond,
@@ -1271,8 +1281,12 @@ func toPersistedCodex(value config.CodexConfig) persistedCodex {
 }
 
 func fromPersistedCodex(value persistedCodex) config.CodexConfig {
+	var prompts []string
+	if value.Prompts != nil {
+		prompts = nonNil(*value.Prompts)
+	}
 	return config.CodexConfig{
-		Binary: value.Binary, PromptsFile: value.PromptsFile,
+		Binary: value.Binary, PromptsFile: value.PromptsFile, Prompts: prompts, PromptsPersisted: value.Prompts != nil,
 		RequestTimeoutSecond: value.RequestTimeoutSecond,
 		RetryMinSecond:       value.RetryMinSecond, RetryMaxSecond: value.RetryMaxSecond,
 		KeepaliveMinSecond: value.KeepaliveMinSecond, KeepaliveMaxSecond: value.KeepaliveMaxSecond,

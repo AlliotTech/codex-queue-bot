@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"time"
 
-	"codex-queue-bot/internal/jobs"
-
 	"github.com/gin-gonic/gin"
 )
 
@@ -16,7 +14,7 @@ func (s *Server) events(c *gin.Context) {
 	current := currentValue.(session)
 	sessionIDValue, _ := c.Get("session_id")
 	sessionID := sessionIDValue.(string)
-	initialState, initialActivities, managerSubscription := s.manager.Observe(s.observerBuffer)
+	initialState, managerSubscription := s.manager.Observe(s.observerBuffer)
 	defer managerSubscription.Close()
 	initialStatus, statusSubscription := s.status.Observe(8)
 	defer statusSubscription.Close()
@@ -29,7 +27,7 @@ func (s *Server) events(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 	_, _ = fmt.Fprint(c.Writer, "retry: 3000\n\n")
-	if !s.writeSSE(c, "snapshot", "", s.dashboardPayload(initialState, initialActivities, initialStatus, initialTelegramStatus)) {
+	if !s.writeSSE(c, "snapshot", "", s.dashboardPayload(initialState, initialStatus, initialTelegramStatus)) {
 		return
 	}
 
@@ -58,15 +56,8 @@ func (s *Server) events(c *gin.Context) {
 			if !ok {
 				return
 			}
-			switch event.Kind {
-			case jobs.EventState:
-				if event.Snapshot != nil && !s.writeSSE(c, "state", fmt.Sprint(event.ID), s.statePayload(*event.Snapshot, s.status.Snapshot(), s.telegramStatus.Snapshot())) {
-					return
-				}
-			case jobs.EventActivity:
-				if event.Activity != nil && !s.writeSSE(c, "activity", fmt.Sprint(event.ID), makeActivityResponse(*event.Activity)) {
-					return
-				}
+			if event.Snapshot != nil && !s.writeSSE(c, "state", fmt.Sprint(event.ID), s.statePayload(*event.Snapshot, s.status.Snapshot(), s.telegramStatus.Snapshot())) {
+				return
 			}
 		case status, ok := <-statusSubscription.Updates:
 			if !ok {

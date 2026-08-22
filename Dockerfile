@@ -56,4 +56,4 @@ RUN mkdir -p /app/data && chmod 0700 /app/data && chown -R 10001:10001 /app/data
 
 USER 10001:10001
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/codex-queue-bot"]
-CMD ["-db", "/app/data/codex-queue-bot.db", "-config", "/app/config.json"]
+CMD ["-db", "/app/data/codex-queue-bot.db"]

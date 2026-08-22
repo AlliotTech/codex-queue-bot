@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -130,6 +131,78 @@ func TestWrongMasterKeyFailsBeforeLoadingConfiguration(t *testing.T) {
 	}
 }
 
+func TestPromptListFallsBackToFileThenPersistsInExistingCodexJSON(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompts.txt")
+	if err := os.WriteFile(promptFile, []byte("first prompt\n# comment\nsecond prompt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(ctx, Options{Path: filepath.Join(dir, "config.db"), MasterKeyBase64: encodedKey('p')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	snapshot, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an older codex JSON record with no prompts property.
+	if _, err := store.db.ExecContext(ctx, `UPDATE config_sections SET data = json_set(json_remove(data, '$.prompts'), '$.prompts_file', ?) WHERE name = 'codex'`, promptFile); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(snapshot.Config.Codex.Prompts, "|"); got != "first prompt|second prompt" {
+		t.Fatalf("fallback prompts = %q", got)
+	}
+	snapshot.Config.Codex.Prompts = []string{"database prompt"}
+	if _, err := store.UpdateCodex(ctx, snapshot.Config.Codex); err != nil {
+		t.Fatal(err)
+	}
+	var rawCodex string
+	if err := store.db.QueryRowContext(ctx, `SELECT data FROM config_sections WHERE name = 'codex'`).Scan(&rawCodex); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(rawCodex), &fields); err != nil {
+		t.Fatal(err)
+	}
+	var storedPrompts []string
+	if raw, ok := fields["prompts"]; !ok {
+		t.Fatal("saved codex JSON is missing prompts property")
+	} else if err := json.Unmarshal(raw, &storedPrompts); err != nil {
+		t.Fatalf("decode saved prompts: %v", err)
+	}
+	if got := strings.Join(storedPrompts, "|"); got != "database prompt" {
+		t.Fatalf("saved prompts property = %q", got)
+	}
+	if err := os.WriteFile(promptFile, []byte("changed file prompt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(persisted.Config.Codex.Prompts, "|"); got != "database prompt" {
+		t.Fatalf("persisted prompts = %q", got)
+	}
+
+	persisted.Config.Codex.Prompts = []string{}
+	if _, err := store.UpdateCodex(ctx, persisted.Config.Codex); err == nil || !strings.Contains(err.Error(), "at least one prompt") {
+		t.Fatalf("empty prompt list error = %v", err)
+	}
+	unchanged, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(unchanged.Config.Codex.Prompts, "|"); got != "database prompt" {
+		t.Fatalf("rejected empty save changed prompts = %q", got)
+	}
+}
+
 func TestSchemaUpgradeAppliesMissingMigrations(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "upgrade.db")
@@ -191,7 +264,7 @@ func TestSchemaUpgradeAddsTelegramSectionToInitializedDatabase(t *testing.T) {
 	}
 }
 
-func TestLegacyImportResolvesEnvironmentAndRunsOnlyOnce(t *testing.T) {
+func TestLegacyConfigPathIsIgnored(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	legacyPath := filepath.Join(dir, "config.json")
@@ -220,14 +293,8 @@ func TestLegacyImportResolvesEnvironmentAndRunsOnlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.SuggestedUsername != "legacy-owner" || snapshot.Config.OpenILink.Token != "legacy-token-secret" {
-		t.Fatalf("legacy metadata/openilink = %+v", snapshot)
-	}
-	if got := snapshot.Config.Codex.Targets[0]; got.APIKey != "legacy-target-secret" || got.APIKeyEnv != "" {
-		t.Fatalf("legacy target = %+v", got)
-	}
-	if snapshot.Config.Codex.PromptsFile != filepath.Join(dir, "legacy-prompts.txt") {
-		t.Fatalf("prompts path = %q", snapshot.Config.Codex.PromptsFile)
+	if snapshot.SuggestedUsername != "admin" || snapshot.Config.OpenILink.Token != "" || len(snapshot.Config.Codex.Targets) != 0 {
+		t.Fatalf("legacy config was unexpectedly imported = %+v", snapshot)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -242,7 +309,7 @@ func TestLegacyImportResolvesEnvironmentAndRunsOnlyOnce(t *testing.T) {
 	defer reopened.Close()
 }
 
-func TestLegacyImportEncryptsDirectSecretsAndDisabledTokenEnv(t *testing.T) {
+func TestIgnoredLegacySecretsNeverEnterDatabase(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	legacyPath := filepath.Join(dir, "config.json")
@@ -266,11 +333,8 @@ func TestLegacyImportEncryptsDirectSecretsAndDisabledTokenEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Config.OpenILinkEnabled() || snapshot.Config.OpenILink.Token != "disabled-token-secret" || snapshot.Config.OpenILink.TokenEnv != "" {
-		t.Fatalf("disabled OpenILink import = %+v", snapshot.Config.OpenILink)
-	}
-	if got := snapshot.Config.Codex.Targets[0]; got.APIKey != "direct-target-secret" || got.APIKeyEnv != "" {
-		t.Fatalf("direct target import = %+v", got)
+	if snapshot.Config.OpenILinkEnabled() || snapshot.Config.OpenILink.Token != "" || len(snapshot.Config.Codex.Targets) != 0 {
+		t.Fatalf("ignored legacy snapshot = %+v", snapshot)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -283,7 +347,7 @@ func TestLegacyImportEncryptsDirectSecretsAndDisabledTokenEnv(t *testing.T) {
 	}
 }
 
-func TestLegacyImportFailureIsAtomicAndCanBeRetried(t *testing.T) {
+func TestInvalidLegacyConfigDoesNotBlockFreshDatabase(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	legacyPath := filepath.Join(dir, "config.json")
@@ -292,9 +356,11 @@ func TestLegacyImportFailureIsAtomicAndCanBeRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "data", "config.db")
-	if _, err := Open(ctx, Options{Path: path, MasterKeyBase64: encodedKey('r'), LegacyConfigPath: legacyPath}); err == nil || !strings.Contains(err.Error(), "MISSING_IMPORT_KEY") {
-		t.Fatalf("first import error = %v", err)
+	store, err := Open(ctx, Options{Path: path, MasterKeyBase64: encodedKey('r'), LegacyConfigPath: legacyPath})
+	if err != nil {
+		t.Fatalf("fresh database was blocked by legacy config: %v", err)
 	}
+	defer store.Close()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -302,17 +368,9 @@ func TestLegacyImportFailureIsAtomicAndCanBeRetried(t *testing.T) {
 	if strings.Contains(string(raw), "atomic-target") {
 		t.Fatal("failed import left partial target data")
 	}
-	t.Setenv("MISSING_IMPORT_KEY", "retry-secret")
-	// A failed import must not pin the database to the first attempted master
-	// key; the verifier is committed atomically with the imported configuration.
-	store, err := Open(ctx, Options{Path: path, MasterKeyBase64: encodedKey('s'), LegacyConfigPath: legacyPath})
-	if err != nil {
-		t.Fatalf("retry import: %v", err)
-	}
-	defer store.Close()
 	snapshot, _ := store.Load(ctx)
-	if len(snapshot.Config.Codex.Targets) != 1 || snapshot.Config.Codex.Targets[0].APIKey != "retry-secret" {
-		t.Fatalf("retried snapshot = %+v", snapshot)
+	if len(snapshot.Config.Codex.Targets) != 0 {
+		t.Fatalf("legacy target was imported = %+v", snapshot)
 	}
 }
 

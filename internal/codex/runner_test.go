@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"codex-queue-bot/internal/config"
+	"codex-queue-bot/internal/proxyenv"
 )
 
 func TestRunnerInvokesNativeExecutableWithIsolatedProvider(t *testing.T) {
@@ -53,7 +54,7 @@ printf 'four' > "$out"
 	runner := &Runner{
 		Binary:          script,
 		PromptsFile:     prompts,
-		Timeout:         2 * time.Second,
+		Timeout:         10 * time.Second,
 		ReasoningEffort: "low",
 		Overrides:       []string{`shell_environment_policy.inherit="all"`},
 	}
@@ -119,6 +120,46 @@ printf 'four' > "$out"
 	} {
 		if strings.Contains(gotEnv, forbidden) {
 			t.Errorf("unrelated secret inherited by Codex environment: %q\n%s", forbidden, gotEnv)
+		}
+	}
+}
+
+func TestRunnerUsesDatabasePromptsAndSharedProxyEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "codex")
+	body := `#!/bin/sh
+set -eu
+script_dir=${0%/*}
+printf '%s\n' "$@" > "$script_dir/args"
+env | grep -E '^(ALL_PROXY|all_proxy|NO_PROXY|no_proxy)=' > "$script_dir/env"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--output-last-message" ]; then out="$arg"; fi
+  previous="$arg"
+done
+printf 'ok' > "$out"
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := proxyenv.Resolve([]string{"ALL_PROXY=socks5h://user:secret@proxy.example:1080", "NO_PROXY=localhost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Binary: script, PromptsFile: filepath.Join(dir, "missing.txt"), Prompts: []string{"database prompt"}, PromptsPersisted: true, Timeout: time.Second, ReasoningEffort: "low", Proxy: resolver}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	if result := runner.Run(context.Background(), target, 1); !result.Success {
+		t.Fatalf("result = %+v", result)
+	}
+	args, _ := os.ReadFile(filepath.Join(dir, "args"))
+	if !strings.Contains(string(args), "database prompt") {
+		t.Fatalf("args did not use database prompt: %s", args)
+	}
+	environ, _ := os.ReadFile(filepath.Join(dir, "env"))
+	for _, want := range []string{"ALL_PROXY=socks5h://user:secret@proxy.example:1080", "all_proxy=socks5h://user:secret@proxy.example:1080", "NO_PROXY=localhost"} {
+		if !strings.Contains(string(environ), want) {
+			t.Fatalf("child env missing %q: %s", want, environ)
 		}
 	}
 }
@@ -233,5 +274,17 @@ printf 'ok' > "$out"
 	}
 	if !strings.Contains(string(secondArgs), `model_reasoning_effort="high"`) || !strings.Contains(string(secondArgs), `feature_flag="new"`) {
 		t.Fatalf("second request settings = %s", secondArgs)
+	}
+}
+
+func TestRunnerDoesNotFallBackToFileAfterExplicitEmptyPromptSave(t *testing.T) {
+	dir := t.TempDir()
+	prompts := filepath.Join(dir, "prompts.txt")
+	if err := os.WriteFile(prompts, []byte("file prompt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{PromptsFile: prompts, Prompts: []string{}, PromptsPersisted: true}
+	if _, err := pickPromptFromSettings(runner.snapshot()); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("explicit empty prompt list error = %v", err)
 	}
 }

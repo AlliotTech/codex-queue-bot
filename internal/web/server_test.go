@@ -108,10 +108,10 @@ func newDatabaseWebFixture(t *testing.T, runner *testRunner) databaseWebFixture 
 	return databaseWebFixture{webFixture: webFixture{server: server, manager: manager, cancel: cancel}, store: store}
 }
 
-func setupDatabaseFixture(t *testing.T, server *Server, username, password string) (string, string) {
+func setupDatabaseFixture(t *testing.T, server *Server, username, password string) string {
 	t.Helper()
 	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
-	recorder := performRequest(server, http.MethodPost, "/api/v1/setup", body, "", "", "192.0.2.20:1")
+	recorder := performRequest(server, http.MethodPost, "/api/v1/setup", body, "", "192.0.2.20:1")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("setup status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -123,10 +123,10 @@ func setupDatabaseFixture(t *testing.T, server *Server, username, password strin
 	if len(cookies) != 1 {
 		t.Fatalf("setup cookies = %+v", cookies)
 	}
-	return cookies[0].Name + "=" + cookies[0].Value, response.CSRFToken
+	return cookies[0].Name + "=" + cookies[0].Value
 }
 
-func performRequest(server *Server, method, target, body, cookie, csrf, remote string) *httptest.ResponseRecorder {
+func performRequest(server *Server, method, target, body, cookie, remote string) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(method, target, strings.NewReader(body))
 	request.RemoteAddr = remote
@@ -136,16 +136,13 @@ func performRequest(server *Server, method, target, body, cookie, csrf, remote s
 	if cookie != "" {
 		request.Header.Set("Cookie", cookie)
 	}
-	if csrf != "" {
-		request.Header.Set(csrfHeaderName, csrf)
-	}
 	server.Handler().ServeHTTP(recorder, request)
 	return recorder
 }
 
-func loginFixture(t *testing.T, server *Server) (string, string, *http.Cookie) {
+func loginFixture(t *testing.T, server *Server) (string, *http.Cookie) {
 	t.Helper()
-	recorder := performRequest(server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"correct-horse-battery"}`, "", "", "192.0.2.1:1234")
+	recorder := performRequest(server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"correct-horse-battery"}`, "", "192.0.2.1:1234")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("login status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -157,36 +154,36 @@ func loginFixture(t *testing.T, server *Server) (string, string, *http.Cookie) {
 	if len(cookies) != 1 {
 		t.Fatalf("cookies = %+v", cookies)
 	}
-	return cookies[0].Name + "=" + cookies[0].Value, response.CSRFToken, cookies[0]
+	return cookies[0].Name + "=" + cookies[0].Value, cookies[0]
 }
 
-func TestAuthenticationRateLimitCookieCSRFAndLogout(t *testing.T) {
+func TestAuthenticationCookieSessionAndLogout(t *testing.T) {
 	fixture := newWebFixture(t, &testRunner{}, func(options *Options) { options.CookieSecure = true })
-	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/dashboard", "", "", "", "192.0.2.8:1"); response.Code != http.StatusUnauthorized {
+	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/dashboard", "", "", "192.0.2.8:1"); response.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized dashboard status = %d", response.Code)
 	}
 
 	for attempt := 0; attempt < 5; attempt++ {
-		response := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"wrong-password-value"}`, "", "", "192.0.2.9:1")
+		response := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"wrong-password-value"}`, "", "192.0.2.9:1")
 		if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "用户名或密码错误") {
 			t.Fatalf("failure %d status=%d body=%s", attempt, response.Code, response.Body.String())
 		}
 	}
-	if response := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"wrong-password-value"}`, "", "", "192.0.2.9:1"); response.Code != http.StatusTooManyRequests {
-		t.Fatalf("rate limited status = %d", response.Code)
+	if response := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"wrong-password-value"}`, "", "192.0.2.9:1"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("additional failed login status = %d", response.Code)
 	}
 
-	cookieHeader, csrf, cookie := loginFixture(t, fixture.server)
+	cookieHeader, cookie := loginFixture(t, fixture.server)
 	if !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != "/" {
 		t.Fatalf("session cookie = %+v", cookie)
 	}
-	if response := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.start","targets":["missing"]}`, cookieHeader, "", "192.0.2.1:1"); response.Code != http.StatusForbidden {
-		t.Fatalf("missing CSRF status = %d", response.Code)
+	if response := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.start","targets":["missing"]}`, cookieHeader, "192.0.2.1:1"); response.Code != http.StatusOK {
+		t.Fatalf("session-authenticated action status = %d", response.Code)
 	}
-	if response := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/logout", "", cookieHeader, csrf, "192.0.2.1:1"); response.Code != http.StatusOK {
+	if response := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/logout", "", cookieHeader, "192.0.2.1:1"); response.Code != http.StatusOK {
 		t.Fatalf("logout status = %d body=%s", response.Code, response.Body.String())
 	}
-	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/auth/session", "", cookieHeader, "", "192.0.2.1:1"); response.Code != http.StatusUnauthorized {
+	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/auth/session", "", cookieHeader, "192.0.2.1:1"); response.Code != http.StatusUnauthorized {
 		t.Fatalf("logged out session status = %d", response.Code)
 	}
 }
@@ -194,9 +191,9 @@ func TestAuthenticationRateLimitCookieCSRFAndLogout(t *testing.T) {
 func TestSessionExpiration(t *testing.T) {
 	now := time.Now()
 	fixture := newWebFixture(t, &testRunner{}, func(options *Options) { options.Now = func() time.Time { return now } })
-	cookie, _, _ := loginFixture(t, fixture.server)
+	cookie, _ := loginFixture(t, fixture.server)
 	now = now.Add(13 * time.Hour)
-	response := performRequest(fixture.server, http.MethodGet, "/api/v1/auth/session", "", cookie, "", "192.0.2.1:1")
+	response := performRequest(fixture.server, http.MethodGet, "/api/v1/auth/session", "", cookie, "192.0.2.1:1")
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("expired session status = %d", response.Code)
 	}
@@ -205,29 +202,29 @@ func TestSessionExpiration(t *testing.T) {
 func TestDashboardAndAllActionsDoNotLeakSecrets(t *testing.T) {
 	runner := &testRunner{block: true, start: make(chan struct{})}
 	fixture := newWebFixture(t, runner, nil)
-	cookie, csrf, _ := loginFixture(t, fixture.server)
+	cookie, _ := loginFixture(t, fixture.server)
 
-	start := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.start","targets":["main","missing"]}`, cookie, csrf, "192.0.2.1:1")
+	start := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.start","targets":["main","missing"]}`, cookie, "192.0.2.1:1")
 	if start.Code != http.StatusOK || !strings.Contains(start.Body.String(), `"changed":["main"]`) || !strings.Contains(start.Body.String(), `"unknown":["missing"]`) {
 		t.Fatalf("queue start = %d %s", start.Code, start.Body.String())
 	}
-	stop := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.stop","targets":["main"]}`, cookie, csrf, "192.0.2.1:1")
+	stop := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.stop","targets":["main"]}`, cookie, "192.0.2.1:1")
 	if stop.Code != http.StatusOK || !strings.Contains(stop.Body.String(), `"changed":["main"]`) {
 		t.Fatalf("queue stop = %d %s", stop.Code, stop.Body.String())
 	}
-	keepaliveStart := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"keepalive.start","targets":["main"]}`, cookie, csrf, "192.0.2.1:1")
+	keepaliveStart := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"keepalive.start","targets":["main"]}`, cookie, "192.0.2.1:1")
 	if keepaliveStart.Code != http.StatusOK || !strings.Contains(keepaliveStart.Body.String(), `"changed":["main"]`) {
 		t.Fatalf("keepalive start = %d %s", keepaliveStart.Code, keepaliveStart.Body.String())
 	}
-	keepaliveStop := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"keepalive.stop","targets":[]}`, cookie, csrf, "192.0.2.1:1")
+	keepaliveStop := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"keepalive.stop","targets":[]}`, cookie, "192.0.2.1:1")
 	if keepaliveStop.Code != http.StatusOK || !strings.Contains(keepaliveStop.Body.String(), `"changed":["main"]`) {
 		t.Fatalf("keepalive stop = %d %s", keepaliveStop.Code, keepaliveStop.Body.String())
 	}
-	if invalid := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"config.write","targets":[]}`, cookie, csrf, "192.0.2.1:1"); invalid.Code != http.StatusBadRequest {
+	if invalid := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"config.write","targets":[]}`, cookie, "192.0.2.1:1"); invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid action status = %d", invalid.Code)
 	}
 
-	dashboard := performRequest(fixture.server, http.MethodGet, "/api/v1/dashboard", "", cookie, "", "192.0.2.1:1")
+	dashboard := performRequest(fixture.server, http.MethodGet, "/api/v1/dashboard", "", cookie, "192.0.2.1:1")
 	if dashboard.Code != http.StatusOK {
 		t.Fatalf("dashboard status = %d", dashboard.Code)
 	}
@@ -237,20 +234,20 @@ func TestDashboardAndAllActionsDoNotLeakSecrets(t *testing.T) {
 			t.Fatalf("dashboard leaked %q: %s", secret, body)
 		}
 	}
-	if !strings.Contains(body, `"api_host":"api.example.test"`) || !strings.Contains(body, `"source":"web"`) {
-		t.Fatalf("dashboard missing public state/activity: %s", body)
+	if !strings.Contains(body, `"api_host":"api.example.test"`) || strings.Contains(body, `"source":"web"`) || strings.Contains(body, `"activities"`) {
+		t.Fatalf("dashboard public state/history shape: %s", body)
 	}
 }
 
 func TestActionsRejectOversizedAndUnknownJSON(t *testing.T) {
 	fixture := newWebFixture(t, &testRunner{}, nil)
-	cookie, csrf, _ := loginFixture(t, fixture.server)
-	unknown := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.start","targets":[],"extra":true}`, cookie, csrf, "192.0.2.1:1")
+	cookie, _ := loginFixture(t, fixture.server)
+	unknown := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", `{"action":"queue.start","targets":[],"extra":true}`, cookie, "192.0.2.1:1")
 	if unknown.Code != http.StatusBadRequest {
 		t.Fatalf("unknown field status = %d", unknown.Code)
 	}
 	oversized := `{"action":"queue.start","targets":["` + strings.Repeat("x", maxJSONBody) + `"]}`
-	response := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", oversized, cookie, csrf, "192.0.2.1:1")
+	response := performRequest(fixture.server, http.MethodPost, "/api/v1/actions", oversized, cookie, "192.0.2.1:1")
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("oversized body status = %d", response.Code)
 	}
@@ -258,14 +255,14 @@ func TestActionsRejectOversizedAndUnknownJSON(t *testing.T) {
 
 func TestHealthAndStaticUIArePublic(t *testing.T) {
 	fixture := newWebFixture(t, &testRunner{}, nil)
-	if response := performRequest(fixture.server, http.MethodGet, "/healthz", "", "", "", "192.0.2.1:1"); response.Code != http.StatusOK {
+	if response := performRequest(fixture.server, http.MethodGet, "/healthz", "", "", "192.0.2.1:1"); response.Code != http.StatusOK {
 		t.Fatalf("health status = %d", response.Code)
 	}
-	response := performRequest(fixture.server, http.MethodGet, "/some/client/route", "", "", "", "192.0.2.1:1")
+	response := performRequest(fixture.server, http.MethodGet, "/some/client/route", "", "", "192.0.2.1:1")
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "<div id=\"root\">") {
 		t.Fatalf("SPA status=%d body=%s", response.Code, response.Body.String())
 	}
-	if response := performRequest(fixture.server, http.MethodGet, "/assets/missing.js", "", "", "", "192.0.2.1:1"); response.Code != http.StatusNotFound {
+	if response := performRequest(fixture.server, http.MethodGet, "/assets/missing.js", "", "", "192.0.2.1:1"); response.Code != http.StatusNotFound {
 		t.Fatalf("missing asset status = %d", response.Code)
 	}
 }
@@ -294,24 +291,24 @@ func TestSSEInitialSnapshotHeartbeatRealtimeAndDisconnectCleanup(t *testing.T) {
 	}
 	reader := bufio.NewReader(response.Body)
 	event, data := readSSEEvent(t, reader)
-	if event != "snapshot" || !strings.Contains(data, `"version":"test-version"`) || !strings.Contains(data, `"activities":[]`) {
+	if event != "snapshot" || !strings.Contains(data, `"version":"test-version"`) || strings.Contains(data, `"activities"`) {
 		t.Fatalf("initial event=%q data=%s", event, data)
 	}
 	event, _ = readSSEEvent(t, reader)
 	if event != "heartbeat" {
 		t.Fatalf("second event = %q, want heartbeat", event)
 	}
-	fixture.manager.StartWithOperation([]string{"main"}, jobs.Subscriber{}, jobs.Operation{Source: jobs.SourceWeb, Actor: "admin"})
-	foundActivity := false
+	fixture.manager.Start([]string{"main"}, jobs.Subscriber{})
+	foundState := false
 	for attempt := 0; attempt < 5; attempt++ {
 		event, data = readSSEEvent(t, reader)
-		if event == "activity" && strings.Contains(data, `"type":"queue.start"`) {
-			foundActivity = true
+		if event == "state" && strings.Contains(data, `"state":"running"`) {
+			foundState = true
 			break
 		}
 	}
-	if !foundActivity {
-		t.Fatal("did not receive realtime activity event")
+	if !foundState {
+		t.Fatal("did not receive realtime state event")
 	}
 	cancel()
 	_ = response.Body.Close()
@@ -357,18 +354,15 @@ func TestSSESessionExpirationEvent(t *testing.T) {
 
 func TestDatabaseSetupCreatesSessionAndRejectsLaterSetup(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
-	status := performRequest(fixture.server, http.MethodGet, "/api/v1/setup/status", "", "", "", "192.0.2.20:1")
+	status := performRequest(fixture.server, http.MethodGet, "/api/v1/setup/status", "", "", "192.0.2.20:1")
 	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"required":true`) || !strings.Contains(status.Body.String(), `"suggested_username":"admin"`) {
 		t.Fatalf("setup status = %d %s", status.Code, status.Body.String())
 	}
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "abcde")
-	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/config", "", cookie, "", "192.0.2.20:1"); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"username":"owner"`) {
+	cookie := setupDatabaseFixture(t, fixture.server, "owner", "abcde")
+	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/config", "", cookie, "192.0.2.20:1"); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"username":"owner"`) {
 		t.Fatalf("config after setup = %d %s", response.Code, response.Body.String())
 	}
-	if csrf == "" {
-		t.Fatal("setup session did not include CSRF token")
-	}
-	second := performRequest(fixture.server, http.MethodPost, "/api/v1/setup", `{"username":"other","password":"correct-horse-battery"}`, "", "", "192.0.2.21:1")
+	second := performRequest(fixture.server, http.MethodPost, "/api/v1/setup", `{"username":"other","password":"correct-horse-battery"}`, "", "192.0.2.21:1")
 	if second.Code != http.StatusConflict {
 		t.Fatalf("second setup = %d %s", second.Code, second.Body.String())
 	}
@@ -421,10 +415,10 @@ func TestDatabaseSetupRaceOnlyCreatesOneAdministrator(t *testing.T) {
 func TestConfigurationTargetLifecycleRestartStatusAndAccountRevocation(t *testing.T) {
 	runner := &testRunner{block: true, start: make(chan struct{})}
 	fixture := newDatabaseWebFixture(t, runner)
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
+	cookie := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
 
 	createBody := `{"name":"main","api_base_url":"https://api.example.test/v1/private","api_key":"target-secret-value","model":"gpt-test","wire_api":"responses","config_overrides":[]}`
-	created := performRequest(fixture.server, http.MethodPost, "/api/v1/targets", createBody, cookie, csrf, "192.0.2.20:1")
+	created := performRequest(fixture.server, http.MethodPost, "/api/v1/targets", createBody, cookie, "192.0.2.20:1")
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create target = %d %s", created.Code, created.Body.String())
 	}
@@ -447,57 +441,48 @@ func TestConfigurationTargetLifecycleRestartStatusAndAccountRevocation(t *testin
 		t.Fatal("target request did not start")
 	}
 	updateBody := `{"sort_order":0,"name":"renamed","api_base_url":"https://api.example.test/v1","api_key":"","model":"gpt-next","wire_api":"responses","config_overrides":[]}`
-	busyUpdate := performRequest(fixture.server, http.MethodPut, fmt.Sprintf("/api/v1/targets/%d", id), updateBody, cookie, csrf, "192.0.2.20:1")
-	if busyUpdate.Code != http.StatusConflict {
-		t.Fatalf("busy update = %d %s", busyUpdate.Code, busyUpdate.Body.String())
+	busyUpdate := performRequest(fixture.server, http.MethodPut, fmt.Sprintf("/api/v1/targets/%d", id), updateBody, cookie, "192.0.2.20:1")
+	if busyUpdate.Code != http.StatusOK || !strings.Contains(busyUpdate.Body.String(), `"name":"renamed"`) {
+		t.Fatalf("running target update = %d %s", busyUpdate.Code, busyUpdate.Body.String())
 	}
-	fixture.manager.Stop([]string{"main"})
 	deadline := time.Now().Add(time.Second)
 	for fixture.manager.ComprehensiveSnapshot().Targets[0].Busy && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
-	}
-	updated := performRequest(fixture.server, http.MethodPut, fmt.Sprintf("/api/v1/targets/%d", id), updateBody, cookie, csrf, "192.0.2.20:1")
-	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"name":"renamed"`) {
-		t.Fatalf("idle update = %d %s", updated.Code, updated.Body.String())
 	}
 	persisted, err := fixture.store.Load(context.Background())
 	if err != nil || persisted.Config.Codex.Targets[0].APIKey != "target-secret-value" {
 		t.Fatalf("blank API key did not keep value: snapshot=%+v err=%v", persisted, err)
 	}
 
-	missingCSRF := performRequest(fixture.server, http.MethodPut, "/api/v1/config/codex", `{}`, cookie, "", "192.0.2.20:1")
-	if missingCSRF.Code != http.StatusForbidden {
-		t.Fatalf("missing CSRF = %d", missingCSRF.Code)
-	}
-	codexBody := `{"binary":"codex-next","prompts_file":"prompts.txt","request_timeout_seconds":90,"retry_min_seconds":2,"retry_max_seconds":4,"keepalive_min_seconds":10,"keepalive_max_seconds":20,"max_parallel":3,"success_message":"ok","reasoning_effort":"medium","config_overrides":[]}`
-	codexUpdate := performRequest(fixture.server, http.MethodPut, "/api/v1/config/codex", codexBody, cookie, csrf, "192.0.2.20:1")
-	if codexUpdate.Code != http.StatusOK || !strings.Contains(codexUpdate.Body.String(), `"restart_required":true`) || !strings.Contains(codexUpdate.Body.String(), `"codex.binary"`) {
+	codexBody := `{"binary":"codex-next","prompts_file":"prompts.txt","prompts":["health check"],"request_timeout_seconds":90,"retry_min_seconds":2,"retry_max_seconds":4,"keepalive_min_seconds":10,"keepalive_max_seconds":20,"max_parallel":3,"success_message":"ok","reasoning_effort":"medium","config_overrides":[]}`
+	codexUpdate := performRequest(fixture.server, http.MethodPut, "/api/v1/config/codex", codexBody, cookie, "192.0.2.20:1")
+	if codexUpdate.Code != http.StatusOK || strings.Contains(codexUpdate.Body.String(), `"codex.binary"`) {
 		t.Fatalf("codex update = %d %s", codexUpdate.Code, codexUpdate.Body.String())
 	}
 	if snapshot := fixture.manager.ComprehensiveSnapshot(); snapshot.MaxParallel != 3 {
 		t.Fatalf("hot max_parallel = %d", snapshot.MaxParallel)
 	}
-	invalidWeb := performRequest(fixture.server, http.MethodPut, "/api/v1/config/web", `{"listen_address":"not-an-address","cookie_secure":false,"trusted_proxies":[],"activity_limit":10}`, cookie, csrf, "192.0.2.20:1")
+	invalidWeb := performRequest(fixture.server, http.MethodPut, "/api/v1/config/web", `{"listen_address":"not-an-address","cookie_secure":false,"trusted_proxies":[]}`, cookie, "192.0.2.20:1")
 	if invalidWeb.Code != http.StatusBadRequest {
 		t.Fatalf("invalid web config = %d %s", invalidWeb.Code, invalidWeb.Body.String())
 	}
-	invalidAccount := performRequest(fixture.server, http.MethodPut, "/api/v1/account", `{"username":"owner","new_password":"1234"}`, cookie, csrf, "192.0.2.20:1")
+	invalidAccount := performRequest(fixture.server, http.MethodPut, "/api/v1/account", `{"username":"owner","new_password":"1234"}`, cookie, "192.0.2.20:1")
 	if invalidAccount.Code != http.StatusBadRequest {
 		t.Fatalf("invalid account password = %d %s", invalidAccount.Code, invalidAccount.Body.String())
 	}
-	dashboard := performRequest(fixture.server, http.MethodGet, "/api/v1/dashboard", "", cookie, "", "192.0.2.20:1")
-	if dashboard.Code != http.StatusOK || !strings.Contains(dashboard.Body.String(), `"restart_required":true`) || strings.Contains(dashboard.Body.String(), "target-secret-value") {
+	dashboard := performRequest(fixture.server, http.MethodGet, "/api/v1/dashboard", "", cookie, "192.0.2.20:1")
+	if dashboard.Code != http.StatusOK || strings.Contains(dashboard.Body.String(), `"restart_required":true`) || strings.Contains(dashboard.Body.String(), "target-secret-value") {
 		t.Fatalf("dashboard restart/security = %d %s", dashboard.Code, dashboard.Body.String())
 	}
 
-	account := performRequest(fixture.server, http.MethodPut, "/api/v1/account", `{"username":"new-owner","new_password":"new-correct-horse-battery","current_password":"correct-horse-battery"}`, cookie, csrf, "192.0.2.20:1")
+	account := performRequest(fixture.server, http.MethodPut, "/api/v1/account", `{"username":"new-owner","new_password":"new-correct-horse-battery","current_password":"correct-horse-battery"}`, cookie, "192.0.2.20:1")
 	if account.Code != http.StatusOK || !strings.Contains(account.Body.String(), `"reauthentication_required":true`) {
 		t.Fatalf("account update = %d %s", account.Code, account.Body.String())
 	}
-	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/config", "", cookie, "", "192.0.2.20:1"); response.Code != http.StatusUnauthorized {
+	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/config", "", cookie, "192.0.2.20:1"); response.Code != http.StatusUnauthorized {
 		t.Fatalf("old session after account update = %d", response.Code)
 	}
-	login := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/login", `{"username":"new-owner","password":"new-correct-horse-battery"}`, "", "", "192.0.2.30:1")
+	login := performRequest(fixture.server, http.MethodPost, "/api/v1/auth/login", `{"username":"new-owner","password":"new-correct-horse-battery"}`, "", "192.0.2.30:1")
 	if login.Code != http.StatusOK {
 		t.Fatalf("new credentials login = %d %s", login.Code, login.Body.String())
 	}
@@ -505,14 +490,14 @@ func TestConfigurationTargetLifecycleRestartStatusAndAccountRevocation(t *testin
 
 func TestOpenILinkTokenMaskKeepAndClearRules(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
+	cookie := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
 	base := `{"enabled":false,"base_url":"https://hub.example","allowed_user_ids":[],"http_timeout_seconds":15,`
 
-	setToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", base+`"token":"openilink-secret","clear_token":false}`, cookie, csrf, "192.0.2.20:1")
+	setToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", base+`"token":"openilink-secret","clear_token":false}`, cookie, "192.0.2.20:1")
 	if setToken.Code != http.StatusOK || strings.Contains(setToken.Body.String(), "openilink-secret") || !strings.Contains(setToken.Body.String(), `"token_set":true`) {
 		t.Fatalf("set token = %d %s", setToken.Code, setToken.Body.String())
 	}
-	keepToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", base+`"token":"","clear_token":false}`, cookie, csrf, "192.0.2.20:1")
+	keepToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", base+`"token":"","clear_token":false}`, cookie, "192.0.2.20:1")
 	if keepToken.Code != http.StatusOK || !strings.Contains(keepToken.Body.String(), `"token_set":true`) {
 		t.Fatalf("keep token = %d %s", keepToken.Code, keepToken.Body.String())
 	}
@@ -520,11 +505,11 @@ func TestOpenILinkTokenMaskKeepAndClearRules(t *testing.T) {
 	if err != nil || persisted.Config.OpenILink.Token != "openilink-secret" {
 		t.Fatalf("persisted token after blank update = %q, err=%v", persisted.Config.OpenILink.Token, err)
 	}
-	invalidClear := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", `{"enabled":true,"base_url":"https://hub.example","allowed_user_ids":[],"http_timeout_seconds":15,"token":"","clear_token":true}`, cookie, csrf, "192.0.2.20:1")
+	invalidClear := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", `{"enabled":true,"base_url":"https://hub.example","allowed_user_ids":[],"http_timeout_seconds":15,"token":"","clear_token":true}`, cookie, "192.0.2.20:1")
 	if invalidClear.Code != http.StatusBadRequest {
 		t.Fatalf("enabled token clear = %d %s", invalidClear.Code, invalidClear.Body.String())
 	}
-	clearToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", base+`"token":"","clear_token":true}`, cookie, csrf, "192.0.2.20:1")
+	clearToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", base+`"token":"","clear_token":true}`, cookie, "192.0.2.20:1")
 	if clearToken.Code != http.StatusOK || !strings.Contains(clearToken.Body.String(), `"token_set":false`) {
 		t.Fatalf("clear token = %d %s", clearToken.Code, clearToken.Body.String())
 	}
@@ -532,14 +517,14 @@ func TestOpenILinkTokenMaskKeepAndClearRules(t *testing.T) {
 
 func TestTelegramTokenMaskKeepAndClearRules(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
+	cookie := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
 	base := `{"enabled":false,"base_url":"https://api.telegram.org","allowed_user_ids":["123"],"http_timeout_seconds":45,"poll_timeout_seconds":30,`
 
-	setToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"telegram-secret","clear_token":false}`, cookie, csrf, "192.0.2.20:1")
+	setToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"telegram-secret","clear_token":false}`, cookie, "192.0.2.20:1")
 	if setToken.Code != http.StatusOK || strings.Contains(setToken.Body.String(), "telegram-secret") || !strings.Contains(setToken.Body.String(), `"token_set":true`) {
 		t.Fatalf("set Telegram token = %d %s", setToken.Code, setToken.Body.String())
 	}
-	keepToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"","clear_token":false}`, cookie, csrf, "192.0.2.20:1")
+	keepToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"","clear_token":false}`, cookie, "192.0.2.20:1")
 	if keepToken.Code != http.StatusOK || !strings.Contains(keepToken.Body.String(), `"token_set":true`) {
 		t.Fatalf("keep Telegram token = %d %s", keepToken.Code, keepToken.Body.String())
 	}
@@ -547,22 +532,22 @@ func TestTelegramTokenMaskKeepAndClearRules(t *testing.T) {
 	if err != nil || persisted.Config.Telegram.Token != "telegram-secret" {
 		t.Fatalf("persisted Telegram token = %q, err=%v", persisted.Config.Telegram.Token, err)
 	}
-	invalidClear := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", `{"enabled":true,"base_url":"https://api.telegram.org","allowed_user_ids":[],"http_timeout_seconds":45,"poll_timeout_seconds":30,"token":"","clear_token":true}`, cookie, csrf, "192.0.2.20:1")
+	invalidClear := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", `{"enabled":true,"base_url":"https://api.telegram.org","allowed_user_ids":[],"http_timeout_seconds":45,"poll_timeout_seconds":30,"token":"","clear_token":true}`, cookie, "192.0.2.20:1")
 	if invalidClear.Code != http.StatusBadRequest {
 		t.Fatalf("enabled Telegram token clear = %d %s", invalidClear.Code, invalidClear.Body.String())
 	}
-	clearToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"","clear_token":true}`, cookie, csrf, "192.0.2.20:1")
+	clearToken := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", base+`"token":"","clear_token":true}`, cookie, "192.0.2.20:1")
 	if clearToken.Code != http.StatusOK || !strings.Contains(clearToken.Body.String(), `"token_set":false`) {
 		t.Fatalf("clear Telegram token = %d %s", clearToken.Code, clearToken.Body.String())
 	}
 }
 
-func TestRestartRequiredClearsForNewServerStartup(t *testing.T) {
+func TestHotCodexConfigDoesNotRequireRestartAndStartupRevisionRemainsCompatible(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
-	cookie, csrf := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
-	codexBody := `{"binary":"codex-next","prompts_file":"prompts.txt","request_timeout_seconds":180,"retry_min_seconds":3,"retry_max_seconds":8,"keepalive_min_seconds":2700,"keepalive_max_seconds":3300,"max_parallel":2,"success_message":"ok","reasoning_effort":"low","config_overrides":[]}`
-	updated := performRequest(fixture.server, http.MethodPut, "/api/v1/config/codex", codexBody, cookie, csrf, "192.0.2.20:1")
-	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"restart_required":true`) {
+	cookie := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
+	codexBody := `{"binary":"codex-next","prompts_file":"prompts.txt","prompts":["health check"],"request_timeout_seconds":180,"retry_min_seconds":3,"retry_max_seconds":8,"keepalive_min_seconds":2700,"keepalive_max_seconds":3300,"max_parallel":2,"success_message":"ok","reasoning_effort":"low","config_overrides":[]}`
+	updated := performRequest(fixture.server, http.MethodPut, "/api/v1/config/codex", codexBody, cookie, "192.0.2.20:1")
+	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"restart_required":false`) {
 		t.Fatalf("pre-restart config = %d %s", updated.Code, updated.Body.String())
 	}
 
@@ -588,14 +573,24 @@ func TestRestartRequiredClearsForNewServerStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	login := performRequest(restarted, http.MethodPost, "/api/v1/auth/login", `{"username":"owner","password":"correct-horse-battery"}`, "", "", "192.0.2.30:1")
+	login := performRequest(restarted, http.MethodPost, "/api/v1/auth/login", `{"username":"owner","password":"correct-horse-battery"}`, "", "192.0.2.30:1")
 	if login.Code != http.StatusOK {
 		t.Fatalf("restart login = %d %s", login.Code, login.Body.String())
 	}
 	cookies := login.Result().Cookies()
-	configResponse := performRequest(restarted, http.MethodGet, "/api/v1/config", "", cookies[0].Name+"="+cookies[0].Value, "", "192.0.2.30:1")
+	configResponse := performRequest(restarted, http.MethodGet, "/api/v1/config", "", cookies[0].Name+"="+cookies[0].Value, "192.0.2.30:1")
 	if configResponse.Code != http.StatusOK || !strings.Contains(configResponse.Body.String(), `"restart_required":false`) || !strings.Contains(configResponse.Body.String(), `"loaded_startup_revision":`+fmt.Sprint(snapshot.Revision)) {
 		t.Fatalf("post-restart config = %d %s", configResponse.Code, configResponse.Body.String())
+	}
+}
+
+func TestCodexConfigurationRejectsEmptyPromptList(t *testing.T) {
+	fixture := newDatabaseWebFixture(t, &testRunner{})
+	cookie := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
+	body := `{"binary":"codex","prompts_file":"prompts.txt","prompts":[],"request_timeout_seconds":180,"retry_min_seconds":3,"retry_max_seconds":8,"keepalive_min_seconds":2700,"keepalive_max_seconds":3300,"max_parallel":2,"success_message":"ok","reasoning_effort":"low","config_overrides":[]}`
+	response := performRequest(fixture.server, http.MethodPut, "/api/v1/config/codex", body, cookie, "192.0.2.20:1")
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "at least one prompt") {
+		t.Fatalf("empty prompt response = %d %s", response.Code, response.Body.String())
 	}
 }
 

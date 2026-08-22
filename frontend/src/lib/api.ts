@@ -29,17 +29,6 @@ export interface Target {
   }
 }
 
-export interface Activity {
-  id: number
-  type: string
-  target: string
-  source: "web" | "openilink" | "telegram" | "system"
-  actor: string
-  attempts: number
-  at: string
-  error?: string
-}
-
 export interface Dashboard {
   version: string
   generated_at: string
@@ -50,7 +39,6 @@ export interface Dashboard {
   telegram: { state: string; error?: string; updated_at: string | null }
   concurrency: { current: number; max: number }
   targets: Target[]
-  activities: Activity[]
 }
 
 export interface ActionResult {
@@ -79,6 +67,7 @@ export interface Configuration {
   codex: {
     binary: string
     prompts_file: string
+    prompts: string[]
     request_timeout_seconds: number
     retry_min_seconds: number
     retry_max_seconds: number
@@ -131,10 +120,10 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return body as T
 }
 
-function jsonRequest<T>(url: string, csrf: string, method: string, body: unknown) {
+function jsonRequest<T>(url: string, method: string, body: unknown) {
   return request<T>(url, {
     method,
-    headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   })
 }
@@ -144,7 +133,7 @@ export function setupStatus() {
 }
 
 export function setup(username: string, password: string) {
-  return request<{ authenticated: boolean; username: string; csrf_token: string; expires_at: string }>("/api/v1/setup", {
+  return request<{ authenticated: boolean; username: string; expires_at: string }>("/api/v1/setup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
@@ -152,61 +141,61 @@ export function setup(username: string, password: string) {
 }
 
 export function session() {
-  return request<{ authenticated: boolean; username: string; csrf_token: string; expires_at: string }>("/api/v1/auth/session")
+  return request<{ authenticated: boolean; username: string; expires_at: string }>("/api/v1/auth/session")
 }
 
 export function login(username: string, password: string) {
-  return request<{ authenticated: boolean; username: string; csrf_token: string; expires_at: string }>("/api/v1/auth/login", {
+  return request<{ authenticated: boolean; username: string; expires_at: string }>("/api/v1/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
   })
 }
 
-export function logout(csrf: string) {
-  return request<{ logged_out: boolean }>("/api/v1/auth/logout", { method: "POST", headers: { "X-CSRF-Token": csrf } })
+export function logout() {
+  return request<{ logged_out: boolean }>("/api/v1/auth/logout", { method: "POST" })
 }
 
 export function dashboard() {
   return request<Dashboard>("/api/v1/dashboard")
 }
 
-export function action(csrf: string, name: string, targets: string[]) {
-  return jsonRequest<ActionResult>("/api/v1/actions", csrf, "POST", { action: name, targets })
+export function action(name: string, targets: string[]) {
+  return jsonRequest<ActionResult>("/api/v1/actions", "POST", { action: name, targets })
 }
 
 export function getConfiguration() {
   return request<Configuration>("/api/v1/config")
 }
 
-export function updateCodex(csrf: string, value: Configuration["codex"]) {
-  return jsonRequest<Configuration>("/api/v1/config/codex", csrf, "PUT", value)
+export function updateCodex(value: Configuration["codex"]) {
+  return jsonRequest<Configuration>("/api/v1/config/codex", "PUT", value)
 }
 
-export function updateOpenILink(csrf: string, value: Omit<Configuration["openilink"], "token_set"> & { token: string; clear_token: boolean }) {
-  return jsonRequest<Configuration>("/api/v1/config/openilink", csrf, "PUT", value)
+export function updateOpenILink(value: Omit<Configuration["openilink"], "token_set"> & { token: string; clear_token: boolean }) {
+  return jsonRequest<Configuration>("/api/v1/config/openilink", "PUT", value)
 }
 
-export function updateTelegram(csrf: string, value: Omit<Configuration["telegram"], "token_set"> & { token: string; clear_token: boolean }) {
-  return jsonRequest<Configuration>("/api/v1/config/telegram", csrf, "PUT", value)
+export function updateTelegram(value: Omit<Configuration["telegram"], "token_set"> & { token: string; clear_token: boolean }) {
+  return jsonRequest<Configuration>("/api/v1/config/telegram", "PUT", value)
 }
 
-export function updateWeb(csrf: string, value: Configuration["web"]) {
-  return jsonRequest<Configuration>("/api/v1/config/web", csrf, "PUT", value)
+export function updateWeb(value: Configuration["web"]) {
+  return jsonRequest<Configuration>("/api/v1/config/web", "PUT", value)
 }
 
-export function updateAccount(csrf: string, value: { username: string; current_password: string; new_password: string }) {
-  return jsonRequest<{ reauthentication_required: boolean; revision: number }>("/api/v1/account", csrf, "PUT", value)
+export function updateAccount(value: { username: string; current_password: string; new_password: string }) {
+  return jsonRequest<{ reauthentication_required: boolean; revision: number }>("/api/v1/account", "PUT", value)
 }
 
-export function createTarget(csrf: string, value: TargetInput) {
-  return jsonRequest<Configuration>("/api/v1/targets", csrf, "POST", value)
+export function createTarget(value: TargetInput) {
+  return jsonRequest<Configuration>("/api/v1/targets", "POST", value)
 }
 
-export function updateTarget(csrf: string, id: number, value: TargetInput) {
-  return jsonRequest<Configuration>(`/api/v1/targets/${id}`, csrf, "PUT", value)
+export function updateTarget(id: number, value: TargetInput) {
+  return jsonRequest<Configuration>(`/api/v1/targets/${id}`, "PUT", value)
 }
 
-export function deleteTarget(csrf: string, id: number) {
-  return request<Configuration>(`/api/v1/targets/${id}`, { method: "DELETE", headers: { "X-CSRF-Token": csrf } })
+export function deleteTarget(id: number) {
+  return request<Configuration>(`/api/v1/targets/${id}`, { method: "DELETE" })
 }

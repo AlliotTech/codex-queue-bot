@@ -141,8 +141,13 @@ func (c *WebConfig) UnmarshalJSON(data []byte) error {
 }
 
 type CodexConfig struct {
-	Binary               string   `json:"binary,omitempty"`
-	PromptsFile          string   `json:"prompts_file,omitempty"`
+	Binary      string `json:"binary,omitempty"`
+	PromptsFile string `json:"prompts_file,omitempty"`
+	// Prompts is an optional database-backed prompt list.  It was added
+	// without changing the SQLite schema; older records fall back to reading
+	// PromptsFile until the first configuration save.
+	Prompts              []string `json:"prompts,omitempty"`
+	PromptsPersisted     bool     `json:"-"`
 	RequestTimeoutSecond int      `json:"request_timeout_seconds,omitempty"`
 	RetryMinSecond       int      `json:"retry_min_seconds,omitempty"`
 	RetryMaxSecond       int      `json:"retry_max_seconds,omitempty"`
@@ -488,6 +493,14 @@ func ValidateCodex(codexConfig CodexConfig) error {
 	}
 	if strings.TrimSpace(codexConfig.ReasoningEffort) == "" {
 		return errors.New("codex.reasoning_effort is required")
+	}
+	if codexConfig.PromptsPersisted && len(codexConfig.Prompts) == 0 {
+		return errors.New("codex.prompts must contain at least one prompt")
+	}
+	for index, prompt := range codexConfig.Prompts {
+		if strings.TrimSpace(prompt) == "" {
+			return fmt.Errorf("codex.prompts[%d] must not be empty", index)
+		}
 	}
 	switch strings.ToLower(strings.TrimSpace(codexConfig.ReasoningEffort)) {
 	case "low", "medium", "high", "xhigh":

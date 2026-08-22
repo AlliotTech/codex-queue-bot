@@ -16,8 +16,6 @@ services:
     volumes:
       - codex-queue-data:/app/data
       - ./prompts.txt:/app/prompts.txt:ro
-      # For a one-time legacy migration, temporarily add:
-      # - ./config.json:/app/config.json:ro
 
 volumes:
   codex-queue-data:

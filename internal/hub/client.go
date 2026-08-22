@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"codex-queue-bot/internal/proxyenv"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -158,16 +160,34 @@ type eventData struct {
 	} `json:"sender"`
 }
 
-func New(baseURL, token string, timeout time.Duration, logger *slog.Logger) *Client {
+func New(baseURL, token string, timeout time.Duration, logger *slog.Logger, resolvers ...*proxyenv.Resolver) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var resolver *proxyenv.Resolver
+	if len(resolvers) > 0 {
+		resolver = resolvers[0]
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = http.ProxyFromEnvironment
+	transport.Proxy = nil
+	if resolver != nil {
+		transport = resolver.HTTPTransport(transport)
+	}
 	dialer := *websocket.DefaultDialer
-	dialer.Proxy = http.ProxyFromEnvironment
+	dialer.Proxy = nil
+	if resolver != nil {
+		if endpoint, err := url.Parse(baseURL); err == nil {
+			if endpoint.Scheme == "https" {
+				endpoint.Scheme = "wss"
+			} else {
+				endpoint.Scheme = "ws"
+			}
+			dialer.NetDialContext = resolver.WebSocketDialContext(endpoint, nil)
+		}
+	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
+		baseURL: baseURL,
 		token:   token,
 		httpClient: &http.Client{
 			Timeout:   timeout,
@@ -180,6 +200,14 @@ func New(baseURL, token string, timeout time.Duration, logger *slog.Logger) *Cli
 		status:    NewStatusStore(StatusConnecting),
 	}
 }
+
+func NewWithProxy(baseURL, token string, timeout time.Duration, logger *slog.Logger, resolver *proxyenv.Resolver) *Client {
+	return New(baseURL, token, timeout, logger, resolver)
+}
+
+// Close stops the long-running listener and is safe to call repeatedly.  It
+// is used by configuration hot reloads before swapping in a new client.
+func (c *Client) Close() { c.stopAdapter() }
 
 func (c *Client) StatusStore() *StatusStore { return c.status }
 

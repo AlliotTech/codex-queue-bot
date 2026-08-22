@@ -166,7 +166,7 @@ func TestKeepaliveCommandResultsAndIndependentStop(t *testing.T) {
 		t.Fatalf("duplicate startKeepalive = %q", got)
 	}
 	manager.Start([]string{"backup"}, jobs.Subscriber{})
-	if got := handler.stopKeepalive([]string{"primary", "missing"}); got != "已停止保活：primary\n未知目标：missing" {
+	if got := handler.stopKeepalive([]string{"primary", "missing"}); got != "已停止：primary\n未知目标：missing" {
 		t.Fatalf("stopKeepalive = %q", got)
 	}
 	queueSnapshots, _ := manager.Snapshots([]string{"backup"})
@@ -196,7 +196,7 @@ func TestKeepaliveEnglishAliases(t *testing.T) {
 	}
 	incoming.Text = "/stop-keepalive primary"
 	handler.Handle(ctx, incoming)
-	if message := receiveReply(t, recorder); message.content != "已停止保活：primary" {
+	if message := receiveReply(t, recorder); message.content != "已停止：primary" {
 		t.Fatalf("stop keepalive reply = %+v", message)
 	}
 }
@@ -206,7 +206,7 @@ func TestTelegramUsesChatForRepliesAndUserForAuthorization(t *testing.T) {
 	defer cancel()
 	manager := newCommandTestManager(ctx, []config.Target{{Name: "primary"}})
 	recorder := &replyRecorder{messages: make(chan replyMessage, 2)}
-	handler := NewAdapter(manager, recorder, nil, []string{"123"}, jobs.SourceTelegram, "Telegram")
+	handler := NewAdapter(manager, recorder, nil, []string{"123"}, "Telegram")
 	incoming := hub.Incoming{SenderID: "123", ReplyTo: "-456", TraceID: "9", Text: "/status primary"}
 	handler.Handle(ctx, incoming)
 	if message := receiveReply(t, recorder); message.to != "-456" || message.traceID != "9" {
@@ -222,7 +222,7 @@ func TestTelegramUsesChatForRepliesAndUserForAuthorization(t *testing.T) {
 func TestTelegramBareStartShowsHelp(t *testing.T) {
 	manager := newCommandTestManager(context.Background(), []config.Target{{Name: "primary"}})
 	recorder := &replyRecorder{messages: make(chan replyMessage, 1)}
-	handler := NewAdapter(manager, recorder, nil, nil, jobs.SourceTelegram, "Telegram")
+	handler := NewAdapter(manager, recorder, nil, nil, "Telegram")
 	handler.Handle(context.Background(), hub.Incoming{SenderID: "123", ReplyTo: "123", Text: "/start"})
 	message := receiveReply(t, recorder)
 	if !strings.Contains(message.content, "可用命令") {

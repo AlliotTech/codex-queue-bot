@@ -52,20 +52,6 @@ type Subscriber struct {
 	Messenger Messenger
 }
 
-type Source string
-
-const (
-	SourceWeb       Source = "web"
-	SourceOpenILink Source = "openilink"
-	SourceTelegram  Source = "telegram"
-	SourceSystem    Source = "system"
-)
-
-type Operation struct {
-	Source Source
-	Actor  string
-}
-
 type StartResult struct {
 	Started []string
 	Already []string
@@ -84,11 +70,14 @@ type KeepaliveStartResult struct {
 	Unknown []string
 }
 
-type KeepaliveStopResult struct {
-	Stopped  []string
-	Inactive []string
-	Unknown  []string
-}
+// KeepaliveStopResult is retained as an alias for source compatibility.  A
+// stop operation now applies to whichever mode is active on each target.
+type KeepaliveStopResult = StopResult
+
+// TaskStopResult is the result returned by the unified task.stop action.  It
+// intentionally has the same wire shape as the historical queue/keepalive
+// stop results so callers can migrate without a data-format change.
+type TaskStopResult = StopResult
 
 type Snapshot struct {
 	Name        string
@@ -135,29 +124,9 @@ type ManagerSnapshot struct {
 	MaxParallel      int
 }
 
-type Activity struct {
-	ID       uint64
-	Type     string
-	Target   string
-	Source   Source
-	Actor    string
-	Attempts int
-	At       time.Time
-	Error    string
-}
-
-type EventKind string
-
-const (
-	EventState    EventKind = "state"
-	EventActivity EventKind = "activity"
-)
-
 type Event struct {
 	ID       uint64
-	Kind     EventKind
 	Snapshot *ManagerSnapshot
-	Activity *Activity
 }
 
 type Subscription struct {
@@ -176,13 +145,10 @@ type Manager struct {
 	runner         AttemptRunner
 	messenger      Messenger
 	logger         *slog.Logger
-	retryMin       time.Duration
-	retryMax       time.Duration
 	keepaliveMin   time.Duration
 	keepaliveMax   time.Duration
 	successMessage string
 	maxParallel    int
-	activityLimit  int
 
 	mu               sync.Mutex
 	targets          map[string]config.Target
@@ -192,7 +158,6 @@ type Manager struct {
 	arbiters         map[string]*targetArbiter
 	currentProcesses int
 	slotsInUse       int
-	activities       []Activity
 	nextEventID      uint64
 	nextObserverID   uint64
 	observers        map[uint64]chan Event
@@ -202,19 +167,17 @@ type Manager struct {
 }
 
 type job struct {
-	state           State
-	attempts        int
-	startedAt       time.Time
-	lastAttempt     time.Time
-	nextAttempt     time.Time
-	finishedAt      time.Time
-	lastError       string
-	runID           uint64
-	cancel          context.CancelFunc
-	subscribers     map[string]Subscriber
-	operation       Operation
-	scheduleChanged chan struct{}
-	workers         int
+	state       State
+	attempts    int
+	startedAt   time.Time
+	lastAttempt time.Time
+	nextAttempt time.Time
+	finishedAt  time.Time
+	lastError   string
+	runID       uint64
+	cancel      context.CancelFunc
+	subscribers map[string]Subscriber
+	workers     int
 }
 
 type keepaliveJob struct {
@@ -229,7 +192,6 @@ type keepaliveJob struct {
 	lastError       string
 	runID           uint64
 	cancel          context.CancelFunc
-	operation       Operation
 	scheduleChanged chan struct{}
 	workers         int
 }
@@ -260,39 +222,28 @@ func New(
 	runner AttemptRunner,
 	messenger Messenger,
 	logger *slog.Logger,
-	retryMin, retryMax time.Duration,
+	_, _ time.Duration,
 	keepaliveMin, keepaliveMax time.Duration,
 	maxParallel int,
 	successMessage string,
-	activityLimit ...int,
+	_ ...int,
 ) *Manager {
 	if logger == nil {
 		logger = slog.Default()
-	}
-	limit := 200
-	if len(activityLimit) > 0 {
-		limit = activityLimit[0]
-		if limit < 0 {
-			limit = 0
-		}
 	}
 	m := &Manager{
 		root:            root,
 		runner:          runner,
 		messenger:       messenger,
 		logger:          logger,
-		retryMin:        retryMin,
-		retryMax:        retryMax,
 		keepaliveMin:    keepaliveMin,
 		keepaliveMax:    keepaliveMax,
 		successMessage:  successMessage,
 		maxParallel:     maxParallel,
-		activityLimit:   limit,
 		targets:         make(map[string]config.Target, len(targets)),
 		jobs:            make(map[string]*job, len(targets)),
 		keepalives:      make(map[string]*keepaliveJob, len(targets)),
 		arbiters:        make(map[string]*targetArbiter, len(targets)),
-		activities:      make([]Activity, 0, limit),
 		observers:       make(map[uint64]chan Event),
 		parallelChanged: make(chan struct{}),
 	}
@@ -300,7 +251,7 @@ func New(
 		key := normalizeName(target.Name)
 		m.targets[key] = target
 		m.order = append(m.order, key)
-		m.jobs[key] = &job{state: StateIdle, subscribers: make(map[string]Subscriber), scheduleChanged: make(chan struct{})}
+		m.jobs[key] = &job{state: StateIdle, subscribers: make(map[string]Subscriber)}
 		m.keepalives[key] = &keepaliveJob{state: KeepaliveStateStopped, scheduleChanged: make(chan struct{})}
 		m.arbiters[key] = &targetArbiter{changed: make(chan struct{})}
 	}
@@ -308,38 +259,70 @@ func New(
 }
 
 func (m *Manager) Start(names []string, subscriber Subscriber) StartResult {
-	return m.StartWithOperation(names, subscriber, Operation{Source: SourceSystem, Actor: "system"})
+	m.mu.Lock()
+	keys, unknown := m.resolveLocked(names)
+	m.mu.Unlock()
+	result := StartResult{Unknown: unknown}
+	for _, key := range keys {
+		name, started := m.startQueue(key, subscriber)
+		if name == "" {
+			continue
+		}
+		if started {
+			result.Started = append(result.Started, name)
+		} else {
+			result.Already = append(result.Already, name)
+		}
+	}
+	return result
 }
 
-func (m *Manager) StartWithOperation(names []string, subscriber Subscriber, operation Operation) StartResult {
-	operation = normalizeOperation(operation)
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	keys, unknown := m.resolveLocked(names)
-	result := StartResult{Unknown: unknown}
-	if m.shuttingDown {
-		for _, key := range keys {
-			result.Already = append(result.Already, m.targets[key].Name)
-		}
-		return result
-	}
-	changed := false
-	for _, key := range keys {
-		target := m.targets[key]
-		current := m.jobs[key]
-		if subscriber.Recipient != "" {
-			subscriberKey := strings.TrimSpace(subscriber.Key)
-			if subscriberKey == "" {
-				subscriberKey = subscriber.Recipient
+func (m *Manager) startQueue(key string, subscriber Subscriber) (string, bool) {
+	for {
+		// A target has one active mode. Starting queue mode explicitly
+		// switches off keepalive mode and waits for its worker to exit.
+		if !m.prepareMode(key, requestOwnerQueue) {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			target, ok := m.targets[key]
+			if !ok {
+				return "", false
 			}
-			current.subscribers[subscriberKey] = subscriber
+			if subscriber.Recipient != "" && m.jobs[key].state == StateRunning {
+				m.addSubscriberLocked(m.jobs[key], subscriber)
+			}
+			return target.Name, false
 		}
+
+		m.mu.Lock()
+		if m.shuttingDown {
+			target, ok := m.targets[key]
+			m.mu.Unlock()
+			if !ok {
+				return "", false
+			}
+			return target.Name, false
+		}
+		target, exists := m.targets[key]
+		if !exists {
+			m.mu.Unlock()
+			return "", false
+		}
+		current := m.jobs[key]
 		if current.state == StateRunning {
-			result.Already = append(result.Already, target.Name)
+			m.addSubscriberLocked(current, subscriber)
+			m.mu.Unlock()
+			return target.Name, false
+		}
+		// Another caller may have started keepalive after prepareMode released
+		// the manager lock. Retry the transition instead of starting both modes.
+		keepalive := m.keepalives[key]
+		if keepalive.state != KeepaliveStateStopped || keepalive.workers > 0 {
+			m.mu.Unlock()
 			continue
 		}
 
+		m.addSubscriberLocked(current, subscriber)
 		current.runID++
 		runID := current.runID
 		jobCtx, cancel := context.WithCancel(m.root)
@@ -351,11 +334,8 @@ func (m *Manager) StartWithOperation(names []string, subscriber Subscriber, oper
 		current.nextAttempt = time.Time{}
 		current.finishedAt = time.Time{}
 		current.lastError = ""
-		current.operation = operation
-		result.Started = append(result.Started, target.Name)
-		m.recordActivityLocked("queue.start", target.Name, operation, 0, "")
+		m.broadcastStateLocked()
 		m.signalTargetLocked(key)
-		changed = true
 		m.runWG.Add(1)
 		current.workers++
 		go func() {
@@ -363,21 +343,33 @@ func (m *Manager) StartWithOperation(names []string, subscriber Subscriber, oper
 			defer m.finishQueueWorker(key)
 			m.run(jobCtx, key, runID)
 		}()
+		m.mu.Unlock()
+		return target.Name, true
 	}
-	if changed {
-		m.broadcastStateLocked()
-	}
+}
 
-	return result
+func (m *Manager) addSubscriberLocked(current *job, subscriber Subscriber) {
+	if subscriber.Recipient == "" {
+		return
+	}
+	subscriberKey := strings.TrimSpace(subscriber.Key)
+	if subscriberKey == "" {
+		subscriberKey = subscriber.Recipient
+	}
+	current.subscribers[subscriberKey] = subscriber
 }
 
 func (m *Manager) Stop(names []string) StopResult {
-	return m.StopWithOperation(names, Operation{Source: SourceSystem, Actor: "system"})
+	return m.stop(names)
 }
 
-func (m *Manager) StopWithOperation(names []string, operation Operation) StopResult {
-	operation = normalizeOperation(operation)
+// StopTask is the canonical unified stop operation.  Stop and the historical
+// queue.stop/keepalive.stop methods delegate to the same implementation.
+func (m *Manager) StopTask(names []string) TaskStopResult {
+	return m.stop(names)
+}
 
+func (m *Manager) stop(names []string) StopResult {
 	m.mu.Lock()
 	keys, unknown := m.resolveLocked(names)
 	result := StopResult{Unknown: unknown}
@@ -385,23 +377,21 @@ func (m *Manager) StopWithOperation(names []string, operation Operation) StopRes
 	for _, key := range keys {
 		target := m.targets[key]
 		current := m.jobs[key]
-		if current.state != StateRunning {
-			result.Inactive = append(result.Inactive, target.Name)
-			continue
+		keepalive := m.keepalives[key]
+		stopped := false
+		if current.state == StateRunning || current.workers > 0 {
+			m.stopQueueLocked(key)
+			stopped = true
 		}
-		cancel := current.cancel
-		current.runID++
-		current.cancel = nil
-		current.state = StateStopped
-		current.finishedAt = time.Now()
-		current.nextAttempt = time.Time{}
-		current.subscribers = make(map[string]Subscriber)
-		result.Stopped = append(result.Stopped, target.Name)
-		m.recordActivityLocked("queue.stop", target.Name, operation, current.attempts, "")
-		m.signalTargetLocked(key)
-		changed = true
-		if cancel != nil {
-			cancel()
+		if keepalive.state != KeepaliveStateStopped || keepalive.workers > 0 {
+			m.stopKeepaliveLocked(key)
+			stopped = true
+		}
+		if stopped {
+			result.Stopped = append(result.Stopped, target.Name)
+			changed = true
+		} else {
+			result.Inactive = append(result.Inactive, target.Name)
 		}
 	}
 	if changed {
@@ -412,28 +402,60 @@ func (m *Manager) StopWithOperation(names []string, operation Operation) StopRes
 }
 
 func (m *Manager) StartKeepalive(names []string) KeepaliveStartResult {
-	return m.StartKeepaliveWithOperation(names, Operation{Source: SourceSystem, Actor: "system"})
+	m.mu.Lock()
+	keys, unknown := m.resolveLocked(names)
+	m.mu.Unlock()
+	result := KeepaliveStartResult{Unknown: unknown}
+	for _, key := range keys {
+		name, started := m.startKeepalive(key)
+		if name == "" {
+			continue
+		}
+		if started {
+			result.Started = append(result.Started, name)
+		} else {
+			result.Already = append(result.Already, name)
+		}
+	}
+	return result
 }
 
-func (m *Manager) StartKeepaliveWithOperation(names []string, operation Operation) KeepaliveStartResult {
-	operation = normalizeOperation(operation)
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	keys, unknown := m.resolveLocked(names)
-	result := KeepaliveStartResult{Unknown: unknown}
-	if m.shuttingDown {
-		for _, key := range keys {
-			result.Already = append(result.Already, m.targets[key].Name)
+func (m *Manager) startKeepalive(key string) (string, bool) {
+	for {
+		// Keepalive and queue are mutually exclusive on a target. Switching
+		// modes cancels the old worker and waits for its runner call to exit.
+		if !m.prepareMode(key, requestOwnerKeepalive) {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if target, ok := m.targets[key]; ok {
+				return target.Name, false
+			}
+			return "", false
 		}
-		return result
-	}
-	changed := false
-	for _, key := range keys {
-		target := m.targets[key]
+		m.mu.Lock()
+		if m.shuttingDown {
+			target, ok := m.targets[key]
+			m.mu.Unlock()
+			if !ok {
+				return "", false
+			}
+			return target.Name, false
+		}
+		target, exists := m.targets[key]
+		if !exists {
+			m.mu.Unlock()
+			return "", false
+		}
 		current := m.keepalives[key]
 		if current.state != KeepaliveStateStopped {
-			result.Already = append(result.Already, target.Name)
+			m.mu.Unlock()
+			return target.Name, false
+		}
+		// Another caller may have started queue mode after prepareMode released
+		// the manager lock. Retry the transition instead of starting both modes.
+		queue := m.jobs[key]
+		if queue.state == StateRunning || queue.workers > 0 {
+			m.mu.Unlock()
 			continue
 		}
 
@@ -450,11 +472,8 @@ func (m *Manager) StartKeepaliveWithOperation(names []string, operation Operatio
 		current.nextRequest = time.Time{}
 		current.stoppedAt = time.Time{}
 		current.lastError = ""
-		current.operation = operation
-		result.Started = append(result.Started, target.Name)
-		m.recordActivityLocked("keepalive.start", target.Name, operation, 0, "")
+		m.broadcastStateLocked()
 		m.signalTargetLocked(key)
-		changed = true
 		m.runWG.Add(1)
 		current.workers++
 		go func() {
@@ -462,51 +481,16 @@ func (m *Manager) StartKeepaliveWithOperation(names []string, operation Operatio
 			defer m.finishKeepaliveWorker(key)
 			m.runKeepalive(keepaliveCtx, key, runID)
 		}()
+		m.mu.Unlock()
+		return target.Name, true
 	}
-	if changed {
-		m.broadcastStateLocked()
-	}
-
-	return result
 }
 
 func (m *Manager) StopKeepalive(names []string) KeepaliveStopResult {
-	return m.StopKeepaliveWithOperation(names, Operation{Source: SourceSystem, Actor: "system"})
-}
-
-func (m *Manager) StopKeepaliveWithOperation(names []string, operation Operation) KeepaliveStopResult {
-	operation = normalizeOperation(operation)
-
-	m.mu.Lock()
-	keys, unknown := m.resolveLocked(names)
-	result := KeepaliveStopResult{Unknown: unknown}
-	changed := false
-	for _, key := range keys {
-		target := m.targets[key]
-		current := m.keepalives[key]
-		if current.state == KeepaliveStateStopped {
-			result.Inactive = append(result.Inactive, target.Name)
-			continue
-		}
-		cancel := current.cancel
-		current.runID++
-		current.cancel = nil
-		current.state = KeepaliveStateStopped
-		current.stoppedAt = time.Now()
-		current.nextRequest = time.Time{}
-		result.Stopped = append(result.Stopped, target.Name)
-		m.recordActivityLocked("keepalive.stop", target.Name, operation, current.requests, "")
-		m.signalTargetLocked(key)
-		changed = true
-		if cancel != nil {
-			cancel()
-		}
-	}
-	if changed {
-		m.broadcastStateLocked()
-	}
-	m.mu.Unlock()
-	return result
+	// Historically this method only stopped keepalive.  Keep it as a
+	// compatibility name, but make it obey the unified task.stop semantics so
+	// `/停止保活` cannot leave a queue task running on the same target.
+	return m.stop(names)
 }
 
 func (m *Manager) Snapshots(names []string) ([]Snapshot, []string) {
@@ -541,23 +525,10 @@ func (m *Manager) ComprehensiveSnapshot() ManagerSnapshot {
 	return m.snapshotLocked()
 }
 
-func (m *Manager) DashboardSnapshot() (ManagerSnapshot, []Activity) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.snapshotLocked(), m.activitiesLocked()
-}
-
-// Activities returns newest-first copies of the in-memory activity log.
-func (m *Manager) Activities() []Activity {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.activitiesLocked()
-}
-
-// Observe atomically registers an observer and returns the initial state and
-// activity log. Producers never block: an observer whose buffer fills is
-// removed and its channel is closed, allowing an SSE client to reconnect.
-func (m *Manager) Observe(buffer int) (ManagerSnapshot, []Activity, *Subscription) {
+// Observe atomically registers a state observer and returns the initial
+// snapshot. Producers never block: an observer whose buffer fills is removed
+// and its channel is closed, allowing an SSE client to reconnect.
+func (m *Manager) Observe(buffer int) (ManagerSnapshot, *Subscription) {
 	if buffer <= 0 {
 		buffer = 32
 	}
@@ -578,7 +549,7 @@ func (m *Manager) Observe(buffer int) (ManagerSnapshot, []Activity, *Subscriptio
 			}
 		},
 	}
-	return m.snapshotLocked(), m.activitiesLocked(), subscription
+	return m.snapshotLocked(), subscription
 }
 
 func (m *Manager) ObserverCount() int {
@@ -632,28 +603,28 @@ func (m *Manager) TargetNames() []string {
 	return names
 }
 
+// SetMessenger replaces the default success-notification route.  A stable
+// proxy can be installed here while its underlying message client is hot
+// reloaded independently.
+func (m *Manager) SetMessenger(messenger Messenger) {
+	m.mu.Lock()
+	m.messenger = messenger
+	m.mu.Unlock()
+}
+
 // UpdateSettings applies request-level configuration without interrupting
 // running Codex processes. Waiting retry and keepalive timers are resampled
 // from the update instant when their interval changes.
 func (m *Manager) UpdateSettings(
-	retryMin, retryMax time.Duration,
+	_, _ time.Duration,
 	keepaliveMin, keepaliveMax time.Duration,
 	maxParallel int,
 	successMessage string,
-	activityLimit int,
+	_ ...int,
 ) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
-	if retryMin != m.retryMin || retryMax != m.retryMax {
-		m.retryMin, m.retryMax = retryMin, retryMax
-		for key, current := range m.jobs {
-			if current.state == StateRunning && !current.nextAttempt.IsZero() {
-				current.nextAttempt = now.Add(randomDuration(m.retryMin, m.retryMax))
-				m.signalQueueScheduleLocked(key)
-			}
-		}
-	}
 	if keepaliveMin != m.keepaliveMin || keepaliveMax != m.keepaliveMax {
 		m.keepaliveMin, m.keepaliveMax = keepaliveMin, keepaliveMax
 		for key, current := range m.keepalives {
@@ -668,15 +639,6 @@ func (m *Manager) UpdateSettings(
 		m.signalParallelLocked()
 	}
 	m.successMessage = successMessage
-	if activityLimit < 0 {
-		activityLimit = 0
-	}
-	if activityLimit != m.activityLimit {
-		m.activityLimit = activityLimit
-		if len(m.activities) > activityLimit {
-			m.activities = append([]Activity(nil), m.activities[len(m.activities)-activityLimit:]...)
-		}
-	}
 	m.broadcastStateLocked()
 }
 
@@ -712,7 +674,7 @@ func (m *Manager) CreateTarget(target *config.Target, persist func() error) erro
 		return ErrTargetConflict
 	}
 	m.targets[key] = *target
-	m.jobs[key] = &job{state: StateIdle, subscribers: make(map[string]Subscriber), scheduleChanged: make(chan struct{})}
+	m.jobs[key] = &job{state: StateIdle, subscribers: make(map[string]Subscriber)}
 	m.keepalives[key] = &keepaliveJob{state: KeepaliveStateStopped, scheduleChanged: make(chan struct{})}
 	m.arbiters[key] = &targetArbiter{changed: make(chan struct{})}
 	m.order = append(m.order, key)
@@ -726,8 +688,26 @@ func (m *Manager) UpdateTarget(id int64, target *config.Target, persist func() e
 		return ErrTargetNotFound
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	oldKey, ok := m.targetKeyByIDLocked(id)
+	if !ok {
+		m.mu.Unlock()
+		return ErrTargetNotFound
+	}
+	if m.targetBusyLocked(oldKey) {
+		m.stopQueueLocked(oldKey)
+		m.stopKeepaliveLocked(oldKey)
+		m.broadcastStateLocked()
+	}
+	m.mu.Unlock()
+	if !m.waitTargetIdle(oldKey, 10*time.Second) {
+		return ErrTargetBusy
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Re-check after waiting.  Holding the lock across persistence prevents a
+	// concurrent start from observing a half-applied target update.
+	oldKey, ok = m.targetKeyByIDLocked(id)
 	if !ok {
 		return ErrTargetNotFound
 	}
@@ -773,8 +753,24 @@ func (m *Manager) UpdateTarget(id int64, target *config.Target, persist func() e
 
 func (m *Manager) DeleteTarget(id int64, persist func() error) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	key, ok := m.targetKeyByIDLocked(id)
+	if !ok {
+		m.mu.Unlock()
+		return ErrTargetNotFound
+	}
+	if m.targetBusyLocked(key) {
+		m.stopQueueLocked(key)
+		m.stopKeepaliveLocked(key)
+		m.broadcastStateLocked()
+	}
+	m.mu.Unlock()
+	if !m.waitTargetIdle(key, 10*time.Second) {
+		return ErrTargetBusy
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key, ok = m.targetKeyByIDLocked(id)
 	if !ok {
 		return ErrTargetNotFound
 	}
@@ -811,6 +807,136 @@ func (m *Manager) targetKeyByIDLocked(id int64) (string, bool) {
 
 func (m *Manager) targetBusyLocked(key string) bool {
 	return m.jobs[key].state == StateRunning || m.jobs[key].workers > 0 || m.keepalives[key].state != KeepaliveStateStopped || m.keepalives[key].workers > 0
+}
+
+// prepareMode enforces the one-mode-per-target invariant.  It is deliberately
+// outside the manager's main lock while waiting: Codex runners must be able to
+// finish and run their cleanup paths (which take the same lock) before a new
+// mode is started.
+func (m *Manager) prepareMode(key string, desired requestOwner) bool {
+	for {
+		m.mu.Lock()
+		if _, ok := m.targets[key]; !ok || m.shuttingDown {
+			m.mu.Unlock()
+			return false
+		}
+		queue := m.jobs[key]
+		keepalive := m.keepalives[key]
+		if desired == requestOwnerQueue && queue.state == StateRunning {
+			m.mu.Unlock()
+			return false
+		}
+		if desired == requestOwnerKeepalive && keepalive.state != KeepaliveStateStopped {
+			m.mu.Unlock()
+			return false
+		}
+
+		changed := false
+		if desired == requestOwnerQueue && (keepalive.state != KeepaliveStateStopped || keepalive.workers > 0) {
+			m.stopKeepaliveLocked(key)
+			changed = true
+		}
+		if desired == requestOwnerKeepalive && (queue.state == StateRunning || queue.workers > 0) {
+			m.stopQueueLocked(key)
+			changed = true
+		}
+		// A previous stop may still be unwinding its runner.  Do not let a new
+		// worker acquire the target arbiter until that cleanup has completed.
+		busy := m.targetBusyLocked(key)
+		if changed {
+			m.broadcastStateLocked()
+		}
+		m.mu.Unlock()
+
+		if busy {
+			if !m.waitTargetIdle(key, 10*time.Second) {
+				return false
+			}
+			continue
+		}
+		return true
+	}
+}
+
+// stopQueueLocked and stopKeepaliveLocked only mutate state and issue the
+// cancellation signal.  The caller owns the manager lock and may batch a
+// single state broadcast for several targets.
+func (m *Manager) stopQueueLocked(key string) {
+	current, ok := m.jobs[key]
+	if !ok || (current.state != StateRunning && current.workers == 0) {
+		return
+	}
+	cancel := current.cancel
+	current.runID++
+	current.cancel = nil
+	if current.state == StateRunning {
+		current.state = StateStopped
+		current.finishedAt = time.Now()
+		current.nextAttempt = time.Time{}
+		current.subscribers = make(map[string]Subscriber)
+	}
+	m.signalTargetLocked(key)
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (m *Manager) stopKeepaliveLocked(key string) {
+	current, ok := m.keepalives[key]
+	if !ok || (current.state == KeepaliveStateStopped && current.workers == 0) {
+		return
+	}
+	cancel := current.cancel
+	current.runID++
+	current.cancel = nil
+	if current.state != KeepaliveStateStopped {
+		current.state = KeepaliveStateStopped
+		current.stoppedAt = time.Now()
+		current.nextRequest = time.Time{}
+	}
+	m.signalTargetLocked(key)
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// waitTargetIdle waits until no worker or request owner remains for a target.
+// It is exported for the Web CRUD layer, which must guarantee that a target is
+// quiescent before persisting a replacement or deleting it.
+func (m *Manager) WaitTargetIdle(id int64, timeout time.Duration) bool {
+	m.mu.Lock()
+	key, ok := m.targetKeyByIDLocked(id)
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return m.waitTargetIdle(key, timeout)
+}
+
+func (m *Manager) waitTargetIdle(key string, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		m.mu.Lock()
+		_, exists := m.targets[key]
+		idle := exists && !m.targetBusyLocked(key) && m.arbiters[key].owner == requestOwnerNone
+		m.mu.Unlock()
+		if !exists || idle {
+			return exists
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-m.root.Done():
+			stopTimer(timer)
+			return false
+		case <-timer.C:
+		}
+	}
 }
 
 func (m *Manager) finishQueueWorker(key string) {
@@ -904,43 +1030,10 @@ func (m *Manager) snapshotLocked() ManagerSnapshot {
 	return snapshot
 }
 
-func (m *Manager) activitiesLocked() []Activity {
-	result := make([]Activity, len(m.activities))
-	for i := range m.activities {
-		result[len(m.activities)-1-i] = m.activities[i]
-	}
-	return result
-}
-
-func (m *Manager) recordActivityLocked(activityType, target string, operation Operation, attempts int, errorText string) {
-	operation = normalizeOperation(operation)
-	if targetConfig, ok := m.targets[normalizeName(target)]; ok {
-		errorText = sanitizeTargetError(targetConfig, errorText)
-	}
-	m.nextEventID++
-	activity := Activity{
-		ID:       m.nextEventID,
-		Type:     activityType,
-		Target:   target,
-		Source:   operation.Source,
-		Actor:    operation.Actor,
-		Attempts: attempts,
-		At:       time.Now(),
-		Error:    truncate(errorText, 600),
-	}
-	m.activities = append(m.activities, activity)
-	if len(m.activities) > m.activityLimit {
-		copy(m.activities, m.activities[len(m.activities)-m.activityLimit:])
-		m.activities = m.activities[:m.activityLimit]
-	}
-	activityCopy := activity
-	m.publishLocked(Event{ID: activity.ID, Kind: EventActivity, Activity: &activityCopy})
-}
-
 func (m *Manager) broadcastStateLocked() {
 	m.nextEventID++
 	snapshot := m.snapshotLocked()
-	m.publishLocked(Event{ID: m.nextEventID, Kind: EventState, Snapshot: &snapshot})
+	m.publishLocked(Event{ID: m.nextEventID, Snapshot: &snapshot})
 }
 
 func (m *Manager) publishLocked(event Event) {
@@ -994,10 +1087,10 @@ func (m *Manager) run(ctx context.Context, key string, runID uint64) {
 			return
 		}
 		m.logger.Warn("Codex queue attempt failed", "target", target.Name, "attempt", attempt, "error", sanitizeTargetError(target, result.Error), "retry_in", delay)
-		if !m.waitQueueRetry(ctx, key, runID) {
-			m.markQueueCancelled(key, runID)
-			return
-		}
+		// Queue admission is intentionally aggressive: after a failed request
+		// the worker immediately competes for the global slot again.  Retry
+		// interval fields remain persisted for rollback compatibility, but are
+		// no longer used by the runtime.
 	}
 }
 
@@ -1154,12 +1247,13 @@ func (m *Manager) markFailure(key string, runID uint64, result codex.Result) (ti
 	defer m.mu.Unlock()
 	current := m.jobs[key]
 	valid := current.runID == runID && current.state == StateRunning
-	delay := randomDuration(m.retryMin, m.retryMax)
+	// Keep the return value for callers and old diagnostics, but do not use it
+	// to schedule queue retries.  Only keepalive requests are randomized.
+	delay := time.Duration(0)
 	if valid {
 		target := m.targets[key]
 		current.lastError = sanitizeTargetError(target, result.Error)
-		current.nextAttempt = time.Now().Add(delay)
-		m.recordActivityLocked("queue.request.failure", target.Name, current.operation, current.attempts, current.lastError)
+		current.nextAttempt = time.Time{}
 	}
 	m.releaseTargetLocked(key, requestOwnerQueue, runID)
 	if valid {
@@ -1189,8 +1283,6 @@ func (m *Manager) markSuccess(key string, runID uint64) ([]Subscriber, time.Dura
 		subscribers = append(subscribers, subscriber)
 	}
 	current.subscribers = make(map[string]Subscriber)
-	target := m.targets[key]
-	m.recordActivityLocked("queue.request.success", target.Name, current.operation, current.attempts, "")
 	m.releaseTargetLocked(key, requestOwnerQueue, runID)
 	m.broadcastStateLocked()
 	return subscribers, current.finishedAt.Sub(current.startedAt), true
@@ -1214,14 +1306,6 @@ func (m *Manager) finishKeepaliveRequest(key string, runID uint64, result codex.
 	}
 	current.state = KeepaliveStateWaitingNext
 	current.nextRequest = now.Add(delay)
-	target := m.targets[key]
-	activityType := "keepalive.request.failure"
-	activityError := current.lastError
-	if result.Success {
-		activityType = "keepalive.request.success"
-		activityError = ""
-	}
-	m.recordActivityLocked(activityType, target.Name, current.operation, current.requests, activityError)
 	m.releaseTargetLocked(key, requestOwnerKeepalive, runID)
 	m.broadcastStateLocked()
 	return delay, true
@@ -1240,8 +1324,6 @@ func (m *Manager) markQueueCancelled(key string, runID uint64) {
 	current.nextAttempt = time.Time{}
 	current.cancel = nil
 	current.subscribers = make(map[string]Subscriber)
-	target := m.targets[key]
-	m.recordActivityLocked("queue.stop", target.Name, Operation{Source: SourceSystem, Actor: "shutdown"}, current.attempts, "")
 	m.signalTargetLocked(key)
 	m.broadcastStateLocked()
 }
@@ -1258,8 +1340,6 @@ func (m *Manager) markKeepaliveCancelled(key string, runID uint64) {
 	current.stoppedAt = time.Now()
 	current.nextRequest = time.Time{}
 	current.cancel = nil
-	target := m.targets[key]
-	m.recordActivityLocked("keepalive.stop", target.Name, Operation{Source: SourceSystem, Actor: "shutdown"}, current.requests, "")
 	m.signalTargetLocked(key)
 	m.broadcastStateLocked()
 }
@@ -1393,35 +1473,6 @@ func (m *Manager) signalParallelLocked() {
 	m.parallelChanged = make(chan struct{})
 }
 
-func (m *Manager) waitQueueRetry(ctx context.Context, key string, runID uint64) bool {
-	for {
-		m.mu.Lock()
-		current, ok := m.jobs[key]
-		if !ok || current.runID != runID || current.state != StateRunning {
-			m.mu.Unlock()
-			return false
-		}
-		at := current.nextAttempt
-		changed := current.scheduleChanged
-		m.mu.Unlock()
-		remaining := time.Until(at)
-		if remaining <= 0 {
-			return true
-		}
-		timer := time.NewTimer(remaining)
-		select {
-		case <-ctx.Done():
-			stopTimer(timer)
-			return false
-		case <-changed:
-			stopTimer(timer)
-			continue
-		case <-timer.C:
-			return true
-		}
-	}
-}
-
 func (m *Manager) waitKeepaliveNext(ctx context.Context, key string, runID uint64) bool {
 	for {
 		m.mu.Lock()
@@ -1451,12 +1502,6 @@ func (m *Manager) waitKeepaliveNext(ctx context.Context, key string, runID uint6
 	}
 }
 
-func (m *Manager) signalQueueScheduleLocked(key string) {
-	current := m.jobs[key]
-	close(current.scheduleChanged)
-	current.scheduleChanged = make(chan struct{})
-}
-
 func (m *Manager) signalKeepaliveScheduleLocked(key string) {
 	current := m.keepalives[key]
 	close(current.scheduleChanged)
@@ -1475,19 +1520,6 @@ func stopTimer(timer *time.Timer) {
 
 func normalizeName(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
-}
-
-func normalizeOperation(operation Operation) Operation {
-	switch operation.Source {
-	case SourceWeb, SourceOpenILink, SourceTelegram, SourceSystem:
-	default:
-		operation.Source = SourceSystem
-	}
-	operation.Actor = strings.TrimSpace(operation.Actor)
-	if operation.Actor == "" {
-		operation.Actor = string(operation.Source)
-	}
-	return operation
 }
 
 func containsAll(names []string) bool {

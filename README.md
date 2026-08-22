@@ -19,7 +19,7 @@ docker compose logs -f codex-queue-bot
 Compose 默认使用 GHCR 镜像，并持久化 SQLite 数据库：
 
 - 数据库：命名卷 `codex-queue-data` → `/app/data/codex-queue-bot.db`
-- Prompt：只读挂载 `./prompts.txt` → `/app/prompts.txt`
+- Prompt：首次读取 `./prompts.txt`；在控制台保存非空列表后改用 SQLite 中的 prompt 列表
 - 端口：`127.0.0.1:8080:8080`（仅本机访问）
 
 如果需要让局域网直接访问，将 `compose.yaml` 中的映射改为 `8080:8080`，但生产环境建议保持本机绑定并通过 HTTPS 反向代理暴露。代理需要关闭 SSE 缓冲（例如 `proxy_buffering off`），并把读取超时设为至少一小时。
@@ -44,28 +44,27 @@ SQLite 是运行时的唯一配置源。登录控制台后可以维护 target、
 
 ```text
 -db <path>       SQLite 路径（默认 data/codex-queue-bot.db）
--config <path>   仅用于首次导入旧 JSON（默认 config.json）
+-config <path>   废弃兼容参数；不再读取 JSON
 -check           执行配置、Codex 和 Prompt 预检后退出
 -version         输出版本
 ```
 
-旧版 JSON 仅支持一次性迁移。需要迁移时，复制并修改 [config.example.json](config.example.json)，按 `compose.yaml` 中的注释临时挂载 `config.json`，启动成功后移除挂载。迁移会把 API Key 和 Token 加密写入 SQLite，之后不再读取 JSON。
-
-请同时备份 `codex-queue-data` 卷和 `CODEX_QUEUE_MASTER_KEY`。会话、任务状态和活动记录保存在内存中，服务重启后会清空。
+旧版 `config.json` 导入链路已移除。请同时备份 `codex-queue-data` 卷和 `CODEX_QUEUE_MASTER_KEY`。会话与任务状态保存在内存中，服务重启后会清空。
 
 ## 控制台与任务
 
-控制台展示 SSE、OpenILink、Telegram 状态、并发概览、每个 target 的排队/保活状态和近期活动，并支持单个或批量启动、停止任务。最大并发可在“任务与保活”中修改并立即生效；降低并发不会中断已经运行的请求。配置页会标记需要重启才能生效的字段。
+控制台展示 SSE、OpenILink、Telegram 状态、并发概览和每个 target 的排队/保活状态，并支持单个或批量“开始挤队列”“开始保活”“停止当前任务”。最大并发可在“任务与保活”中修改并立即生效；降低并发不会中断已经运行的请求。
 
 任务规则：
 
-- 排队失败后按配置的随机区间重试，成功后停止该 target。
+- 排队失败后立即重新竞争全局并发槽，成功后停止该 target；旧重试区间仅为回滚兼容保留。
 - 保活启动后立即请求，之后在随机区间内继续请求；失败只记录状态。
-- 同一 target 不会同时执行排队和保活；排队优先。
+- 同一 target 只有一个活动模式；切换模式时先取消并等待当前请求退出。
+- 编辑或删除运行中的 target 会先停止任务并最多等待 10 秒；超时则返回冲突且不写数据库。
 
 ## 消息入口（可选）
 
-OpenILink 和 Telegram 默认关闭，可在控制台分别配置并启用；任一入口连接失败或鉴权失败都不会影响 Web 控制台。Telegram 使用 Bot API 长轮询，无需公网 Webhook。建议填写允许的用户 ID；留空表示允许所有能联系机器人的用户执行命令。
+OpenILink 和 Telegram 默认关闭，可在控制台分别配置并启用；地址、Token、超时、白名单或启用状态保存后立即热重载。网络错误指数退避，Token 被拒绝后显示 `unauthorized` 并等待配置修改。Telegram 使用 Bot API 长轮询，无需公网 Webhook。
 
 两个入口使用相同的中英文命令：
 
@@ -73,10 +72,10 @@ OpenILink 和 Telegram 默认关闭，可在控制台分别配置并启用；任
 |---|---|---|
 | `/开挤` | `/start` | 开始排队 |
 | `/状态` | `/status` | 查看排队状态 |
-| `/停止` | `/stop` | 停止排队 |
+| `/停止` | `/stop` | 停止当前任务 |
 | `/保活` | `/keepalive` | 开启保活 |
 | `/保活状态` | `/keepalive-status` | 查看保活状态 |
-| `/停止保活` | `/stop-keepalive` | 停止保活 |
+| `/停止保活` | `/stop-keepalive` | 停止当前任务（兼容命令） |
 | `/列表` | `/list` | 查看 target 列表 |
 | `/帮助` | `/help` | 查看帮助 |
 
@@ -108,3 +107,5 @@ npm --prefix frontend run build
 ```
 
 健康检查地址：<http://127.0.0.1:8080/healthz>。
+
+出站代理只从启动环境变量读取，修改后需要重启。支持大小写形式的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`，以及 HTTP、HTTPS、SOCKS5、SOCKS5H；同一解析结果用于 Telegram、OpenILink HTTP/WebSocket 和 Codex 子进程。日志只记录是否启用，不打印代理 URL。
