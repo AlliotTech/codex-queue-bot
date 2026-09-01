@@ -143,6 +143,7 @@ func TestRunnerUsesDatabasePromptsAndSharedProxyEnvironment(t *testing.T) {
 	body := `#!/bin/sh
 set -eu
 script_dir=${0%/*}
+cat > "$script_dir/prompt"
 printf '%s\n' "$@" > "$script_dir/args"
 env | grep -E '^(ALL_PROXY|all_proxy|NO_PROXY|no_proxy)=' > "$script_dir/env"
 out=""
@@ -165,9 +166,9 @@ printf 'ok' > "$out"
 	if result := runner.Run(context.Background(), target, 1); !result.Success {
 		t.Fatalf("result = %+v", result)
 	}
-	args, _ := os.ReadFile(filepath.Join(dir, "args"))
-	if !strings.Contains(string(args), "database prompt") {
-		t.Fatalf("args did not use database prompt: %s", args)
+	prompt, _ := os.ReadFile(filepath.Join(dir, "prompt"))
+	if !strings.Contains(string(prompt), "database prompt") {
+		t.Fatalf("stdin did not use database prompt: %s", prompt)
 	}
 	environ, _ := os.ReadFile(filepath.Join(dir, "env"))
 	for _, want := range []string{"ALL_PROXY=socks5h://user:secret@proxy.example:1080", "all_proxy=socks5h://user:secret@proxy.example:1080", "NO_PROXY=localhost"} {
