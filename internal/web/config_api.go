@@ -151,6 +151,22 @@ type targetConfiguration struct {
 	Busy            bool     `json:"busy"`
 }
 
+// configurationSecretsResponse is intentionally served by a separate,
+// authenticated endpoint. The normal configuration payload only exposes
+// whether a secret is set, so routine polling and React state updates cannot
+// accidentally copy credentials into the browser.
+type configurationSecretsResponse struct {
+	OpenILinkToken string                 `json:"openilink_token"`
+	TelegramToken  string                 `json:"telegram_token"`
+	Targets        []targetSecretResponse `json:"targets"`
+}
+
+type targetSecretResponse struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	APIKey string `json:"api_key"`
+}
+
 func (s *Server) setupStatus(c *gin.Context) {
 	if s.configStore == nil {
 		c.JSON(http.StatusOK, setupStatusResponse{Required: false, SuggestedUsername: s.username})
@@ -203,6 +219,18 @@ func (s *Server) getConfig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, s.configurationPayload(s.currentConfiguration()))
+}
+
+// getConfigSecrets reveals decrypted credentials only after the caller has an
+// authenticated administrator session and explicitly requests them. The
+// endpoint is separate from /config so normal configuration loads remain
+// secret-free and are safe to cache in client state.
+func (s *Server) getConfigSecrets(c *gin.Context) {
+	if s.configStore == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "配置接口不可用"})
+		return
+	}
+	c.JSON(http.StatusOK, s.configurationSecretsPayload(s.currentConfiguration()))
 }
 
 func (s *Server) updateCodexConfig(c *gin.Context) {
@@ -680,6 +708,20 @@ func (s *Server) configurationPayload(snapshot storage.Snapshot) configurationRe
 			ID: target.ID, SortOrder: target.SortOrder, Name: target.Name, APIBaseURL: target.APIBaseURL,
 			APIKeySet: target.APIKey != "", Model: target.Model, WireAPI: target.WireAPI,
 			ConfigOverrides: nonNilStrings(target.ConfigOverrides), Busy: busy[target.ID],
+		})
+	}
+	return result
+}
+
+func (s *Server) configurationSecretsPayload(snapshot storage.Snapshot) configurationSecretsResponse {
+	result := configurationSecretsResponse{
+		OpenILinkToken: snapshot.Config.OpenILink.Token,
+		TelegramToken:  snapshot.Config.Telegram.Token,
+		Targets:        make([]targetSecretResponse, 0, len(snapshot.Config.Codex.Targets)),
+	}
+	for _, target := range snapshot.Config.Codex.Targets {
+		result.Targets = append(result.Targets, targetSecretResponse{
+			ID: target.ID, Name: target.Name, APIKey: target.APIKey,
 		})
 	}
 	return result

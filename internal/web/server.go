@@ -230,6 +230,7 @@ func (s *Server) routes() {
 	authorized.POST("/actions", s.actions)
 	authorized.GET("/events", s.events)
 	authorized.GET("/config", s.getConfig)
+	authorized.GET("/config/secrets", s.getConfigSecrets)
 	authorized.PUT("/config/codex", s.updateCodexConfig)
 	authorized.PUT("/config/openilink", s.updateOpenILinkConfig)
 	authorized.PUT("/config/telegram", s.updateTelegramConfig)

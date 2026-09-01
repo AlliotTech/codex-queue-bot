@@ -103,6 +103,12 @@ export interface Configuration {
   targets: ConfigurationTarget[]
 }
 
+export interface ConfigurationSecrets {
+  openilink_token: string
+  telegram_token: string
+  targets: Array<{ id: number; name: string; api_key: string }>
+}
+
 export interface TargetInput {
   sort_order?: number
   name: string
@@ -166,6 +172,10 @@ export function action(name: string, targets: string[]) {
 
 export function getConfiguration() {
   return request<Configuration>("/api/v1/config")
+}
+
+export function getConfigurationSecrets() {
+  return request<ConfigurationSecrets>("/api/v1/config/secrets")
 }
 
 export function updateCodex(value: Configuration["codex"]) {

@@ -138,6 +138,33 @@ describe("console", () => {
     expect(screen.queryByText("new-secret")).not.toBeInTheDocument()
   })
 
+  it("reveals a saved target key only after clicking the visibility control", async () => {
+    MockEventSource.instances = []
+    vi.stubGlobal("EventSource", MockEventSource)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith("/setup/status")) return publicStatus(false)
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/dashboard")) return new Response(JSON.stringify(dashboard), { status: 200 })
+      if (url.endsWith("/config") && !init?.method) return new Response(JSON.stringify(configuration), { status: 200 })
+      if (url.endsWith("/config/secrets")) return new Response(JSON.stringify({ openilink_token: "openilink-secret", telegram_token: "telegram-secret", targets: [{ id: 1, name: "main", api_key: "target-secret" }] }), { status: 200 })
+      throw new Error(`unexpected request ${url} ${init?.method}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    render(<App />)
+    await screen.findByText("main")
+    fireEvent.click(screen.getByRole("button", { name: "配置" }))
+    fireEvent.click(await screen.findByRole("button", { name: "编辑" }))
+    const reveal = screen.getByRole("button", { name: "显示API Key" })
+    expect(screen.getByLabelText("API Key")).toHaveAttribute("type", "password")
+    fireEvent.click(reveal)
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/config/secrets"))).toBe(true))
+    await waitFor(() => expect(screen.getByLabelText("API Key")).toHaveValue("target-secret"))
+    expect(screen.getByLabelText("API Key")).toHaveAttribute("type", "text")
+    fireEvent.click(screen.getByRole("button", { name: "隐藏API Key" }))
+    expect(screen.getByLabelText("API Key")).toHaveAttribute("type", "password")
+  })
+
   it("validates random intervals and shows restart and server errors", async () => {
     MockEventSource.instances = []
     vi.stubGlobal("EventSource", MockEventSource)

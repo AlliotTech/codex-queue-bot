@@ -488,6 +488,41 @@ func TestConfigurationTargetLifecycleRestartStatusAndAccountRevocation(t *testin
 	}
 }
 
+func TestConfigurationSecretsRequireSessionAndReturnPlaintextOnlyOnExplicitRequest(t *testing.T) {
+	fixture := newDatabaseWebFixture(t, &testRunner{})
+	if response := performRequest(fixture.server, http.MethodGet, "/api/v1/config/secrets", "", "", "192.0.2.20:1"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated secrets response = %d %s", response.Code, response.Body.String())
+	}
+	cookie := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")
+	create := performRequest(fixture.server, http.MethodPost, "/api/v1/targets", `{"name":"main","api_base_url":"https://api.example.test/v1","api_key":"target-secret","model":"gpt-test","wire_api":"responses","config_overrides":[]}`, cookie, "192.0.2.20:1")
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create target = %d %s", create.Code, create.Body.String())
+	}
+	openILink := performRequest(fixture.server, http.MethodPut, "/api/v1/config/openilink", `{"enabled":false,"base_url":"https://hub.example","allowed_user_ids":[],"http_timeout_seconds":15,"token":"openilink-secret","clear_token":false}`, cookie, "192.0.2.20:1")
+	if openILink.Code != http.StatusOK {
+		t.Fatalf("save OpenILink = %d %s", openILink.Code, openILink.Body.String())
+	}
+	telegram := performRequest(fixture.server, http.MethodPut, "/api/v1/config/telegram", `{"enabled":false,"base_url":"https://api.telegram.org","allowed_user_ids":[],"http_timeout_seconds":45,"poll_timeout_seconds":30,"token":"telegram-secret","clear_token":false}`, cookie, "192.0.2.20:1")
+	if telegram.Code != http.StatusOK {
+		t.Fatalf("save Telegram = %d %s", telegram.Code, telegram.Body.String())
+	}
+	masked := performRequest(fixture.server, http.MethodGet, "/api/v1/config", "", cookie, "192.0.2.20:1")
+	if strings.Contains(masked.Body.String(), "target-secret") || strings.Contains(masked.Body.String(), "openilink-secret") || strings.Contains(masked.Body.String(), "telegram-secret") {
+		t.Fatalf("normal configuration response leaked a secret: %s", masked.Body.String())
+	}
+	revealed := performRequest(fixture.server, http.MethodGet, "/api/v1/config/secrets", "", cookie, "192.0.2.20:1")
+	if revealed.Code != http.StatusOK {
+		t.Fatalf("secrets response = %d %s", revealed.Code, revealed.Body.String())
+	}
+	var secrets configurationSecretsResponse
+	if err := json.Unmarshal(revealed.Body.Bytes(), &secrets); err != nil {
+		t.Fatal(err)
+	}
+	if secrets.OpenILinkToken != "openilink-secret" || secrets.TelegramToken != "telegram-secret" || len(secrets.Targets) != 1 || secrets.Targets[0].APIKey != "target-secret" {
+		t.Fatalf("revealed secrets = %+v", secrets)
+	}
+}
+
 func TestOpenILinkTokenMaskKeepAndClearRules(t *testing.T) {
 	fixture := newDatabaseWebFixture(t, &testRunner{})
 	cookie := setupDatabaseFixture(t, fixture.server, "owner", "correct-horse-battery")

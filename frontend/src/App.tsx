@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react"
 import {
   Activity, AlertTriangle, ArrowLeft, ArrowUp, CircleStop,
-  Database, Link2, LogOut, Pencil, Play, Plus, Radio, RefreshCw,
+  Database, Eye, EyeOff, Link2, LogOut, Pencil, Play, Plus, Radio, RefreshCw,
   Save, Send, Server, Settings, ShieldCheck, SlidersHorizontal, Trash2,
   UserCog, Wifi,
 } from "lucide-react"
 import {
-  action, createTarget, dashboard, deleteTarget, getConfiguration, login, logout,
+  action, createTarget, dashboard, deleteTarget, getConfiguration, getConfigurationSecrets, login, logout,
   session, setup, setupStatus, updateAccount, updateCodex, updateOpenILink, updateTelegram,
   updateTarget, updateWeb, type Configuration,
-  type ConfigurationTarget, type Dashboard, type Target, type TargetInput,
+  type ConfigurationSecrets, type ConfigurationTarget, type Dashboard, type Target, type TargetInput,
 } from "./lib/api"
 import { Button } from "./components/ui/button"
 import { Badge } from "./components/ui/badge"
@@ -25,6 +25,43 @@ const minimumAdminPasswordLength = 5
 type Auth = { username: string }
 type Connection = "connecting" | "connected" | "reconnecting" | "closed"
 type ConfigSection = "targets" | "tasks" | "openilink" | "runtime" | "account"
+
+function SecretInput({ value, onChange, placeholder, ariaLabel, fieldName, id, autoComplete, onReveal, onRevealError, disabled }: {
+  value: string
+  onChange: (value: string) => void
+  placeholder?: string
+  ariaLabel?: string
+  fieldName?: string
+  id?: string
+  autoComplete?: string
+  onReveal?: () => Promise<string | undefined>
+  onRevealError?: (error: unknown) => void
+  disabled?: boolean
+}) {
+  const [visible, setVisible] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const toggle = async () => {
+    if (visible) {
+      setVisible(false)
+      return
+    }
+    if (onReveal && !value) {
+      setLoading(true)
+      try {
+        const revealed = await onReveal()
+        if (revealed !== undefined) onChange(revealed)
+      } catch (error) {
+        onRevealError?.(error)
+        return
+      } finally {
+        setLoading(false)
+      }
+    }
+    setVisible(true)
+  }
+  const label = fieldName || ariaLabel || "密钥"
+  return <div className="relative"><Input id={id} aria-label={ariaLabel} type={visible ? "text" : "password"} value={value} onChange={event => onChange(event.target.value)} placeholder={placeholder} autoComplete={autoComplete} className="pr-12" disabled={loading || disabled} /><button type="button" className="absolute right-0 top-1/2 inline-flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50" aria-label={visible ? `隐藏${label}` : `显示${label}`} title={visible ? `隐藏${label}` : `显示${label}`} onClick={() => void toggle()} disabled={loading || disabled}>{loading ? <RefreshCw className="spin" size={15} aria-hidden="true" /> : visible ? <EyeOff size={15} aria-hidden="true" /> : <Eye size={15} aria-hidden="true" />}</button></div>
+}
 
 function SetupPage({ suggested, onComplete }: { suggested: string; onComplete: (auth: Auth) => void }) {
   const [username, setUsername] = useState(suggested || "admin")
@@ -131,7 +168,7 @@ function DashboardPage({ username, onLogout, setView }: { username: string; onLo
 
 const emptyTarget: TargetInput = { name: "", api_base_url: "", api_key: "", model: "", wire_api: "responses", config_overrides: [] }
 
-function TargetEditor({ initial, onCancel, onSave, busy }: { initial?: ConfigurationTarget; onCancel: () => void; onSave: (value: TargetInput) => Promise<void>; busy: boolean }) {
+function TargetEditor({ initial, onCancel, onSave, busy, onRevealAPIKey, onRevealError }: { initial?: ConfigurationTarget; onCancel: () => void; onSave: (value: TargetInput) => Promise<void>; busy: boolean; onRevealAPIKey?: () => Promise<string | undefined>; onRevealError?: (error: unknown) => void }) {
   const [value, setValue] = useState<TargetInput>(() => initial ? { sort_order: initial.sort_order, name: initial.name, api_base_url: initial.api_base_url, api_key: "", model: initial.model, wire_api: initial.wire_api, config_overrides: initial.config_overrides } : { ...emptyTarget })
   const [overrides, setOverrides] = useState((initial?.config_overrides || []).join("\n"))
   const [error, setError] = useState("")
@@ -141,7 +178,7 @@ function TargetEditor({ initial, onCancel, onSave, busy }: { initial?: Configura
     setError("")
     await onSave({ ...value, config_overrides: splitLines(overrides) })
   }
-  return <Card className="editor-card"><CardHeader><CardTitle>{initial ? `编辑 ${initial.name}` : "添加 target"}</CardTitle><p className="muted">名称大小写不敏感唯一；保存前会先停止当前任务，最多等待 10 秒。</p></CardHeader><CardContent><form className="form-grid" onSubmit={submit}><label>名称<Input value={value.name} onChange={event => setValue({ ...value, name: event.target.value })} /></label><label>排序<Input type="number" min={0} value={value.sort_order ?? ""} placeholder="自动追加" onChange={event => setValue({ ...value, sort_order: event.target.value === "" ? undefined : Number(event.target.value) })} /></label><label className="span-2">API Base URL<Input value={value.api_base_url} onChange={event => setValue({ ...value, api_base_url: event.target.value })} placeholder="https://api.example.com/v1" /></label><label>模型<Input value={value.model} onChange={event => setValue({ ...value, model: event.target.value })} /></label><label>Wire API<select value={value.wire_api} onChange={event => setValue({ ...value, wire_api: event.target.value })}><option value="responses">responses</option></select></label><label className="span-2">API Key<Input type="password" value={value.api_key} onChange={event => setValue({ ...value, api_key: event.target.value })} placeholder={initial?.api_key_set ? "已配置；留空保持不变" : "创建时必填"} /><small>{initial?.api_key_set ? "密钥已配置，服务器不会回显。" : "保存时将使用 AES-256-GCM 加密。"}</small></label><label className="span-2">Target Codex overrides<textarea value={overrides} onChange={event => setOverrides(event.target.value)} placeholder="每行一个 key=value" /></label>{error && <p className="error-text span-2" role="alert">{error}</p>}<div className="form-actions span-2"><Button type="button" variant="outline" onClick={onCancel}>取消</Button><Button type="submit" disabled={busy}><Save size={15} />{busy ? "保存中…" : "保存 target"}</Button></div></form></CardContent></Card>
+  return <Card className="editor-card"><CardHeader><CardTitle>{initial ? `编辑 ${initial.name}` : "添加 target"}</CardTitle><p className="muted">名称大小写不敏感唯一；保存前会先停止当前任务，最多等待 10 秒。</p></CardHeader><CardContent><form className="form-grid" onSubmit={submit}><label>名称<Input value={value.name} onChange={event => setValue({ ...value, name: event.target.value })} /></label><label>排序<Input type="number" min={0} value={value.sort_order ?? ""} placeholder="自动追加" onChange={event => setValue({ ...value, sort_order: event.target.value === "" ? undefined : Number(event.target.value) })} /></label><label className="span-2">API Base URL<Input value={value.api_base_url} onChange={event => setValue({ ...value, api_base_url: event.target.value })} placeholder="https://api.example.com/v1" /></label><label>模型<Input value={value.model} onChange={event => setValue({ ...value, model: event.target.value })} /></label><label>Wire API<select value={value.wire_api} onChange={event => setValue({ ...value, wire_api: event.target.value })}><option value="responses">responses</option></select></label><div className="span-2 grid gap-2"><label htmlFor="target-api-key">API Key</label><SecretInput id="target-api-key" value={value.api_key} onChange={api_key => setValue({ ...value, api_key })} placeholder={initial?.api_key_set ? "已配置；留空保持不变" : "创建时必填"} ariaLabel="API Key" fieldName="API Key" onReveal={onRevealAPIKey} onRevealError={onRevealError} disabled={busy} /><small className="muted small">{initial?.api_key_set ? "密钥默认隐藏；点击右侧按钮可显示。" : "保存时将使用 AES-256-GCM 加密。"}</small></div><label className="span-2">Target Codex overrides<textarea value={overrides} onChange={event => setOverrides(event.target.value)} placeholder="每行一个 key=value" /></label>{error && <p className="error-text span-2" role="alert">{error}</p>}<div className="form-actions span-2"><Button type="button" variant="outline" onClick={onCancel}>取消</Button><Button type="submit" disabled={busy}><Save size={15} />{busy ? "保存中…" : "保存 target"}</Button></div></form></CardContent></Card>
 }
 
 function ConfigNavigation({ section, setSection }: { section: ConfigSection; setSection: (section: ConfigSection) => void }) {
@@ -160,6 +197,8 @@ function ConfigurationPage({ username, onLogout, setView }: { username: string; 
   const [clearToken, setClearToken] = useState(false)
   const [telegramToken, setTelegramToken] = useState("")
   const [clearTelegramToken, setClearTelegramToken] = useState(false)
+  const [secrets, setSecrets] = useState<ConfigurationSecrets | null>(null)
+  const [secretsBusy, setSecretsBusy] = useState(false)
   const [account, setAccount] = useState({ username, current: "", password: "", confirm: "" })
   const load = useCallback(async () => {
     try { const result = await getConfiguration(); setData(result); setAccount(value => ({ ...value, username: result.account.username })) }
@@ -171,6 +210,24 @@ function ConfigurationPage({ username, onLogout, setView }: { username: string; 
     setBusy(true); setNotice(""); setError("")
     try { applyResult(await operation(), message) } catch (err) { setError(err instanceof Error ? err.message : "保存失败") } finally { setBusy(false) }
   }
+  const revealSecrets = async () => {
+    if (secrets) return secrets
+    setSecretsBusy(true)
+    try {
+      const result = await getConfigurationSecrets()
+      setSecrets(result)
+      return result
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("未登录")) onLogout()
+      throw err
+    } finally { setSecretsBusy(false) }
+  }
+  const revealTargetAPIKey = async (id: number) => {
+    const result = await revealSecrets()
+    return result.targets.find(target => target.id === id)?.api_key
+  }
+  const revealOpenILinkToken = async () => (await revealSecrets()).openilink_token
+  const revealTelegramToken = async () => (await revealSecrets()).telegram_token
   if (!data) return <main className="loading-shell"><RefreshCw className="spin" />正在加载配置…{error && <span className="error-text">{error}</span>}</main>
   const saveCodex = () => {
     if (data.codex.keepalive_min_seconds > data.codex.keepalive_max_seconds) return setError("保活最小秒数不能大于最大秒数")
@@ -185,11 +242,12 @@ function ConfigurationPage({ username, onLogout, setView }: { username: string; 
     try {
       const result = editing === "new" ? await createTarget(value) : await updateTarget((editing as ConfigurationTarget).id, value)
       applyResult(result, editing === "new" ? "target 已添加并立即生效" : "target 已更新并立即生效")
+      setSecrets(null)
       setEditing(null)
     } catch (err) { setError(err instanceof Error ? err.message : "保存 target 失败") } finally { setBusy(false) }
   }
   return <main className="app-shell"><ConsoleHeader username={username} view="config" setView={setView} onLogout={onLogout} /><RestartBanner fields={data.restart_fields} /><div className="config-layout"><ConfigNavigation section={section} setSection={value => { setSection(value); setEditing(null); setNotice(""); setError("") }} /><section className="config-content"><div className="config-content-header"><Button variant="ghost" size="sm" onClick={() => setView("dashboard")}><ArrowLeft size={15} />返回运行状态</Button><span className="muted">配置版本 r{data.revision}</span></div>{notice && <div className="notice" role="status">{notice}</div>}{error && <div className="error-banner" role="alert"><AlertTriangle size={16} />{error}</div>}
-    {section === "targets" && <div className="stack-lg"><div className="section-heading"><div><h2>Targets</h2><p className="muted">修改、重命名或删除会先停止当前任务，最多等待 10 秒，再写入数据库。</p></div><Button onClick={() => setEditing("new")} disabled={editing !== null}><Plus size={15} />添加 target</Button></div>{editing && <TargetEditor initial={editing === "new" ? undefined : editing} onCancel={() => setEditing(null)} onSave={saveTarget} busy={busy} />}{data.targets.length === 0 ? <Card className="empty-state compact"><CardContent><Database size={30} /><h2>暂无 target</h2><p className="muted">可以先完成其他配置，稍后再添加 API 目标。</p></CardContent></Card> : <div className="config-target-list">{data.targets.map(target => <Card key={target.id}><CardContent className="config-target-row"><div><div className="target-name-line"><strong>{target.name}</strong>{target.busy && <Badge variant="outline">运行中</Badge>}<Badge variant={target.api_key_set ? "secondary" : "destructive"}>{target.api_key_set ? "密钥已配置" : "缺少密钥"}</Badge></div><span>{target.model} · {target.api_base_url}</span><small>排序 {target.sort_order} · {target.wire_api}</small></div><div className="target-actions"><Button size="sm" variant="outline" disabled={editing !== null} onClick={() => setEditing(target)}><Pencil size={14} />编辑</Button><Button size="sm" variant="destructive" disabled={busy} onClick={() => { if (window.confirm(`删除 target ${target.name}？`)) void runSave(() => deleteTarget(target.id), "target 已删除") }}><Trash2 size={14} />删除</Button></div></CardContent></Card>)}</div>}</div>}
+    {section === "targets" && <div className="stack-lg"><div className="section-heading"><div><h2>Targets</h2><p className="muted">修改、重命名或删除会先停止当前任务，最多等待 10 秒，再写入数据库。</p></div><Button onClick={() => setEditing("new")} disabled={editing !== null}><Plus size={15} />添加 target</Button></div>{editing && <TargetEditor initial={editing === "new" ? undefined : editing} onCancel={() => setEditing(null)} onSave={saveTarget} busy={busy} onRevealAPIKey={editing === "new" ? undefined : () => revealTargetAPIKey((editing as ConfigurationTarget).id)} onRevealError={err => setError(err instanceof Error ? err.message : "读取 API Key 失败")} />}{data.targets.length === 0 ? <Card className="empty-state compact"><CardContent><Database size={30} /><h2>暂无 target</h2><p className="muted">可以先完成其他配置，稍后再添加 API 目标。</p></CardContent></Card> : <div className="config-target-list">{data.targets.map(target => <Card key={target.id}><CardContent className="config-target-row"><div><div className="target-name-line"><strong>{target.name}</strong>{target.busy && <Badge variant="outline">运行中</Badge>}<Badge variant={target.api_key_set ? "secondary" : "destructive"}>{target.api_key_set ? "密钥已配置" : "缺少密钥"}</Badge></div><span>{target.model} · {target.api_base_url}</span><small>排序 {target.sort_order} · {target.wire_api}</small></div><div className="target-actions"><Button size="sm" variant="outline" disabled={editing !== null} onClick={() => setEditing(target)}><Pencil size={14} />编辑</Button><Button size="sm" variant="destructive" disabled={busy} onClick={() => { if (window.confirm(`删除 target ${target.name}？`)) void runSave(() => deleteTarget(target.id), "target 已删除") }}><Trash2 size={14} />删除</Button></div></CardContent></Card>)}</div>}</div>}
     {section === "tasks" && <div className="stack-lg"><div><h2>任务与保活</h2><p className="muted">挤队列失败后立即继续竞争并发槽；只有保活请求使用随机间隔。旧重试参数仍保存但不参与运行。</p></div><Card><CardContent className="form-grid padded"><label>请求超时（秒）<Input type="number" min={1} value={data.codex.request_timeout_seconds} onChange={event => codexField("request_timeout_seconds", Number(event.target.value))} /></label><label>最大并发（立即生效）<Input type="number" min={1} value={data.codex.max_parallel} onChange={event => codexField("max_parallel", Number(event.target.value))} /></label><label>旧重试最小秒数（保留）<Input type="number" min={1} value={data.codex.retry_min_seconds} onChange={event => codexField("retry_min_seconds", Number(event.target.value))} /></label><label>旧重试最大秒数（保留）<Input type="number" min={1} value={data.codex.retry_max_seconds} onChange={event => codexField("retry_max_seconds", Number(event.target.value))} /></label><label>保活最小秒数<Input type="number" min={1} value={data.codex.keepalive_min_seconds} onChange={event => codexField("keepalive_min_seconds", Number(event.target.value))} /></label><label>保活最大秒数<Input type="number" min={1} value={data.codex.keepalive_max_seconds} onChange={event => codexField("keepalive_max_seconds", Number(event.target.value))} /></label><label>推理强度<select value={data.codex.reasoning_effort} onChange={event => codexField("reasoning_effort", event.target.value)}><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></label><label>成功消息<Input value={data.codex.success_message} onChange={event => codexField("success_message", event.target.value)} /></label><label className="span-2">全局 Codex overrides<textarea value={data.codex.config_overrides.join("\n")} onChange={event => codexField("config_overrides", splitLines(event.target.value))} placeholder="每行一个 key=value" /></label><div className="form-actions span-2"><Button onClick={saveCodex} disabled={busy}><Save size={15} />保存任务参数</Button></div></CardContent></Card></div>}
     {section === "openilink" && <div className="stack-lg">
       <div><h2>消息入口</h2><p className="muted">OpenILink 与 Telegram 可同时启用；地址、Token、超时、白名单和启用状态保存后立即热重载。</p></div>
@@ -197,20 +255,20 @@ function ConfigurationPage({ username, onLogout, setView }: { username: string; 
         <label className="checkbox-label span-2"><Checkbox checked={data.openilink.enabled} onChange={event => { openField("enabled", event.target.checked); if (event.target.checked) setClearToken(false) }} />启用 OpenILink</label>
         <label className="span-2">Base URL<Input value={data.openilink.base_url} onChange={event => openField("base_url", event.target.value)} /></label>
         <label>HTTP 超时（秒）<Input type="number" min={1} value={data.openilink.http_timeout_seconds} onChange={event => openField("http_timeout_seconds", Number(event.target.value))} /></label>
-        <label>Token<Input type="password" value={token} onChange={event => setToken(event.target.value)} placeholder={data.openilink.token_set ? "已配置；留空保持不变" : "启用前必须配置"} /><small>{data.openilink.token_set ? "Token 已加密保存" : "尚未配置 Token"}</small></label>
+        <div className="grid gap-2"><label htmlFor="openilink-token">Token</label><SecretInput id="openilink-token" value={token} onChange={setToken} placeholder={data.openilink.token_set ? "已配置；留空保持不变" : "启用前必须配置"} ariaLabel="Token" fieldName="OpenILink Token" onReveal={data.openilink.token_set ? revealOpenILinkToken : undefined} onRevealError={err => setError(err instanceof Error ? err.message : "读取 OpenILink Token 失败")} disabled={secretsBusy} /><small className="muted small">{data.openilink.token_set ? "Token 默认隐藏；点击右侧按钮可显示。" : "尚未配置 Token"}</small></div>
         <label className="span-2">允许的用户 ID<textarea value={data.openilink.allowed_user_ids.join("\n")} onChange={event => openField("allowed_user_ids", splitLines(event.target.value))} placeholder="每行一个用户 ID；留空允许全部" /></label>
         <label className="checkbox-label span-2"><Checkbox checked={clearToken} disabled={data.openilink.enabled} onChange={event => setClearToken(event.target.checked)} />显式清除已保存 Token（仅关闭状态可用）</label>
-        <div className="form-actions span-2"><Button disabled={busy} onClick={() => void runSave(async () => { const result = await updateOpenILink({ enabled: data.openilink.enabled, base_url: data.openilink.base_url, token, clear_token: clearToken, allowed_user_ids: data.openilink.allowed_user_ids, http_timeout_seconds: data.openilink.http_timeout_seconds }); setToken(""); setClearToken(false); return result }, "OpenILink 配置已保存并热重载")}><Save size={15} />保存 OpenILink</Button></div>
+        <div className="form-actions span-2"><Button disabled={busy} onClick={() => void runSave(async () => { const result = await updateOpenILink({ enabled: data.openilink.enabled, base_url: data.openilink.base_url, token, clear_token: clearToken, allowed_user_ids: data.openilink.allowed_user_ids, http_timeout_seconds: data.openilink.http_timeout_seconds }); setToken(""); setClearToken(false); setSecrets(null); return result }, "OpenILink 配置已保存并热重载")}><Save size={15} />保存 OpenILink</Button></div>
       </CardContent></Card>
       <Card><CardHeader><CardTitle>Telegram Bot</CardTitle></CardHeader><CardContent className="form-grid">
         <label className="checkbox-label span-2"><Checkbox checked={data.telegram.enabled} onChange={event => { telegramField("enabled", event.target.checked); if (event.target.checked) setClearTelegramToken(false) }} />启用 Telegram Bot</label>
         <label className="span-2">Bot API Base URL<Input aria-label="Bot API Base URL" value={data.telegram.base_url} onChange={event => telegramField("base_url", event.target.value)} placeholder="https://api.telegram.org" /></label>
         <label>HTTP 超时（秒）<Input aria-label="Telegram HTTP 超时（秒）" type="number" min={2} value={data.telegram.http_timeout_seconds} onChange={event => telegramField("http_timeout_seconds", Number(event.target.value))} /></label>
         <label>长轮询超时（秒）<Input aria-label="Telegram 长轮询超时（秒）" type="number" min={1} value={data.telegram.poll_timeout_seconds} onChange={event => telegramField("poll_timeout_seconds", Number(event.target.value))} /><small>HTTP 超时必须大于长轮询超时</small></label>
-        <label className="span-2">Bot Token<Input aria-label="Bot Token" type="password" value={telegramToken} onChange={event => setTelegramToken(event.target.value)} placeholder={data.telegram.token_set ? "已配置；留空保持不变" : "从 BotFather 获取"} /><small>{data.telegram.token_set ? "Token 已加密保存" : "尚未配置 Token"}</small></label>
+        <div className="span-2 grid gap-2"><label htmlFor="telegram-token">Bot Token</label><SecretInput id="telegram-token" value={telegramToken} onChange={setTelegramToken} placeholder={data.telegram.token_set ? "已配置；留空保持不变" : "从 BotFather 获取"} ariaLabel="Bot Token" fieldName="Bot Token" onReveal={data.telegram.token_set ? revealTelegramToken : undefined} onRevealError={err => setError(err instanceof Error ? err.message : "读取 Telegram Token 失败")} disabled={secretsBusy} /><small className="muted small">{data.telegram.token_set ? "Token 默认隐藏；点击右侧按钮可显示。" : "尚未配置 Token"}</small></div>
         <label className="span-2">允许的 Telegram 用户 ID<textarea aria-label="允许的 Telegram 用户 ID" value={data.telegram.allowed_user_ids.join("\n")} onChange={event => telegramField("allowed_user_ids", splitLines(event.target.value))} placeholder="每行一个数字用户 ID；留空允许全部" /></label>
         <label className="checkbox-label span-2"><Checkbox checked={clearTelegramToken} disabled={data.telegram.enabled} onChange={event => setClearTelegramToken(event.target.checked)} />显式清除已保存 Token（仅关闭状态可用）</label>
-        <div className="form-actions span-2"><Button disabled={busy} onClick={() => void runSave(async () => { const result = await updateTelegram({ enabled: data.telegram.enabled, base_url: data.telegram.base_url, token: telegramToken, clear_token: clearTelegramToken, allowed_user_ids: data.telegram.allowed_user_ids, http_timeout_seconds: data.telegram.http_timeout_seconds, poll_timeout_seconds: data.telegram.poll_timeout_seconds }); setTelegramToken(""); setClearTelegramToken(false); return result }, "Telegram 配置已保存并热重载")}><Save size={15} />保存 Telegram</Button></div>
+        <div className="form-actions span-2"><Button disabled={busy} onClick={() => void runSave(async () => { const result = await updateTelegram({ enabled: data.telegram.enabled, base_url: data.telegram.base_url, token: telegramToken, clear_token: clearTelegramToken, allowed_user_ids: data.telegram.allowed_user_ids, http_timeout_seconds: data.telegram.http_timeout_seconds, poll_timeout_seconds: data.telegram.poll_timeout_seconds }); setTelegramToken(""); setClearTelegramToken(false); setSecrets(null); return result }, "Telegram 配置已保存并热重载")}><Save size={15} />保存 Telegram</Button></div>
       </CardContent></Card>
     </div>}
     {section === "runtime" && <div className="stack-lg"><div><h2>Web / 运行文件</h2><p className="muted">Codex binary、prompt 列表和请求参数实时生效；监听地址、Cookie 与 trusted proxies 需要重启。出站代理只读取启动环境变量。</p></div><Card><CardHeader><CardTitle>Codex 运行文件</CardTitle></CardHeader><CardContent className="form-grid"><label>Codex binary<Input value={data.codex.binary} onChange={event => codexField("binary", event.target.value)} /></label><label>旧 Prompts 文件（兼容回退）<Input value={data.codex.prompts_file} onChange={event => codexField("prompts_file", event.target.value)} /></label><label className="span-2">Prompt 列表<textarea value={data.codex.prompts.join("\n")} onChange={event => codexField("prompts", splitLines(event.target.value))} placeholder="每行一个 prompt；至少一行，保存后写入数据库" /></label><div className="form-actions span-2"><Button disabled={busy} onClick={saveCodex}><Save size={15} />保存运行配置</Button></div></CardContent></Card><Card><CardHeader><CardTitle>Web 服务</CardTitle></CardHeader><CardContent className="form-grid"><label>监听地址<Input value={data.web.listen_address} onChange={event => webField("listen_address", event.target.value)} /></label><label>兼容活动上限<Input type="number" min={0} value={data.web.activity_limit} onChange={event => webField("activity_limit", Number(event.target.value))} /><small>保留配置兼容；运行状态与 SSE 不再展示活动历史。</small></label><label className="checkbox-label span-2"><Checkbox checked={data.web.cookie_secure} onChange={event => webField("cookie_secure", event.target.checked)} />仅通过 HTTPS 发送登录 Cookie</label><label className="span-2">Trusted proxies<textarea value={data.web.trusted_proxies.join("\n")} onChange={event => webField("trusted_proxies", splitLines(event.target.value))} placeholder="每行一个 IP 或 CIDR" /></label><div className="form-actions span-2"><Button disabled={busy} onClick={() => void runSave(() => updateWeb(data.web), "Web 配置已保存")}><Save size={15} />保存 Web 配置</Button></div></CardContent></Card></div>}
