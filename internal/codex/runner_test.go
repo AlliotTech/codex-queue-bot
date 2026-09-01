@@ -18,6 +18,7 @@ func TestRunnerInvokesNativeExecutableWithIsolatedProvider(t *testing.T) {
 	capture := filepath.Join(dir, "args.txt")
 	envCapture := filepath.Join(dir, "env.txt")
 	keyCapture := filepath.Join(dir, "key.txt")
+	promptCapture := filepath.Join(dir, "prompt.txt")
 	script := filepath.Join(dir, "fake-codex")
 	if err := os.WriteFile(prompts, []byte("What is 2 + 2?\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -25,6 +26,7 @@ func TestRunnerInvokesNativeExecutableWithIsolatedProvider(t *testing.T) {
 	fake := `#!/bin/sh
 set -eu
 script_dir=${0%/*}
+cat > "$script_dir/prompt.txt"
 printf '%s\n' "$CODEX_QUEUE_TARGET_API_KEY" > "$script_dir/key.txt"
 printf '%s\n' "$@" > "$script_dir/args.txt"
 env | sort > "$script_dir/env.txt"
@@ -76,10 +78,21 @@ printf 'four' > "$out"
 		t.Fatal(err)
 	}
 	gotArgs := string(args)
-	for _, want := range []string{"exec", "--ignore-user-config", "--ephemeral", "model_provider=\"queue_proxy\"", "https://queue.example/v1", `shell_environment_policy.inherit="none"`, "Attempt: 3"} {
+	for _, want := range []string{"exec", "--ignore-user-config", "--ephemeral", "model_provider=\"queue_proxy\"", "https://queue.example/v1", `shell_environment_policy.inherit="none"`} {
 		if !strings.Contains(gotArgs, want) {
 			t.Errorf("args missing %q:\n%s", want, gotArgs)
 		}
+	}
+	argLines := strings.Split(strings.TrimSpace(gotArgs), "\n")
+	if got := argLines[len(argLines)-1]; got != stdinPromptArg {
+		t.Fatalf("prompt argument = %q, want %q:\n%s", got, stdinPromptArg, gotArgs)
+	}
+	prompt, err := os.ReadFile(promptCapture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prompt), "What is 2 + 2?") || !strings.Contains(string(prompt), "Attempt: 3") {
+		t.Fatalf("stdin prompt = %q", prompt)
 	}
 	if got, want := strings.LastIndex(gotArgs, "shell_environment_policy.inherit="), strings.LastIndex(gotArgs, `shell_environment_policy.inherit="none"`); got != want {
 		t.Fatalf("environment isolation override was not enforced last:\n%s", gotArgs)

@@ -25,6 +25,7 @@ import (
 const (
 	providerID       = "queue_proxy"
 	apiKeyEnvName    = "CODEX_QUEUE_TARGET_API_KEY"
+	stdinPromptArg   = "-"
 	maxOutputLen     = 64 * 1024
 	maxDiagnosticLen = 4096
 )
@@ -123,13 +124,14 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 
 	requestID := newRequestID()
 	fullPrompt := fmt.Sprintf("%s\n\nAnswer concisely in at most 80 words. Do not inspect local files, run commands, browse, or use tools. Request ID: %s. Attempt: %d", prompt, requestID, attempt)
-	args := r.argsWithSettings(settings, target, workspace, responsePath, fullPrompt)
+	args := r.argsWithSettings(settings, target, workspace, responsePath, stdinPromptArg)
 
 	requestCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
 	defer cancel()
 	cmd := exec.Command(settings.Binary, args...)
 	cmd.Dir = workspace
 	cmd.Env = r.codexEnvironment(os.Environ(), target.APIKey)
+	cmd.Stdin = strings.NewReader(fullPrompt)
 
 	output := newTailBuffer(maxOutputLen)
 	cmd.Stdout = output

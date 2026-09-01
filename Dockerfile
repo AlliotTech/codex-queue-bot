@@ -43,7 +43,7 @@ FROM debian:bookworm-slim
 # Keep Debian packages on the current security-patched versions from the base image.
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && apt-get install -y --no-install-recommends bubblewrap ca-certificates tini \
     && groupadd --gid 10001 app \
     && useradd --create-home --uid 10001 --gid 10001 --shell /usr/sbin/nologin app \
     && rm -rf /var/lib/apt/lists/*
