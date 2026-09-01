@@ -4,6 +4,7 @@ import { CircleStop, RefreshCw, Send, SquareTerminal } from "lucide-react"
 import { runAdhoc, type AdhocRunResult, type Target } from "../lib/api"
 import { Badge } from "./ui/badge"
 import { Button } from "./ui/button"
+import { Textarea } from "./ui/textarea"
 
 export function AdhocRunDialog({ target, open, onOpenChange }: {
   target: Target | null
@@ -70,7 +71,7 @@ export function AdhocRunDialog({ target, open, onOpenChange }: {
         </div>
         <form className="adhoc-form" onSubmit={submit}>
           <label htmlFor="adhoc-prompt">Prompt</label>
-          <textarea id="adhoc-prompt" aria-label="Prompt" value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="输入要发送给 Codex 的 Prompt" maxLength={32768} disabled={busy} autoFocus />
+          <Textarea id="adhoc-prompt" aria-label="Prompt" value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="输入要发送给 Codex 的 Prompt" maxLength={32768} disabled={busy} autoFocus />
           {error && <div className="error-banner" role="alert">{error}</div>}
           {result && <section className="adhoc-result" aria-label="手动请求结果">
             <div className="adhoc-result-summary">
