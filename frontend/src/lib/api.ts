@@ -7,6 +7,7 @@ export interface Target {
   model: string
   api_host: string
   busy: boolean
+  adhoc_running: boolean
   queue: {
     state: QueueState
     attempts: number
@@ -45,6 +46,17 @@ export interface ActionResult {
   changed: string[]
   unchanged: string[]
   unknown: string[]
+}
+
+export interface AdhocRunResult {
+  target_id: number
+  target: string
+  success: boolean
+  output: string
+  process_output: string
+  exit_code: number
+  error?: string
+  duration_ms: number
 }
 
 export interface ConfigurationTarget {
@@ -168,6 +180,15 @@ export function dashboard() {
 
 export function action(name: string, targets: string[]) {
   return jsonRequest<ActionResult>("/api/v1/actions", "POST", { action: name, targets })
+}
+
+export function runAdhoc(id: number, prompt: string, signal?: AbortSignal) {
+  return request<AdhocRunResult>(`/api/v1/targets/${id}/adhoc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+    signal,
+  })
 }
 
 export function getConfiguration() {

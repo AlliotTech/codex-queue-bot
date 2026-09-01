@@ -28,6 +28,9 @@ const (
 	stdinPromptArg   = "-"
 	maxOutputLen     = 64 * 1024
 	maxDiagnosticLen = 4096
+	// ExitCodeUnavailable is returned when Codex never started or its process
+	// status does not contain a numeric exit code (for example after a signal).
+	ExitCodeUnavailable = -1
 )
 
 type Runner struct {
@@ -54,10 +57,12 @@ type runnerSettings struct {
 }
 
 type Result struct {
-	Success  bool
-	Response string
-	Error    string
-	Duration time.Duration
+	Success       bool
+	Response      string
+	ProcessOutput string
+	ExitCode      int
+	Error         string
+	Duration      time.Duration
 }
 
 func (r *Runner) Check() error {
@@ -94,7 +99,7 @@ func (r *Runner) Check() error {
 
 func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Result {
 	started := time.Now()
-	result := Result{}
+	result := Result{ExitCode: ExitCodeUnavailable}
 	settings := r.snapshot()
 
 	prompt, err := pickPromptFromSettings(settings)
@@ -103,6 +108,28 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 		result.Duration = time.Since(started)
 		return result
 	}
+
+	requestID := newRequestID()
+	fullPrompt := fmt.Sprintf("%s\n\nAnswer concisely in at most 80 words. Do not inspect local files, run commands, browse, or use tools. Request ID: %s. Attempt: %d", prompt, requestID, attempt)
+	return r.runPrompt(ctx, target, fullPrompt, settings, started)
+}
+
+// RunPrompt performs one isolated Codex request with a caller-supplied prompt.
+// Unlike Run, it does not select or decorate a health-check prompt.
+func (r *Runner) RunPrompt(ctx context.Context, target config.Target, prompt string) Result {
+	started := time.Now()
+	if strings.TrimSpace(prompt) == "" {
+		return Result{
+			ExitCode: ExitCodeUnavailable,
+			Error:    "prompt must not be empty",
+			Duration: time.Since(started),
+		}
+	}
+	return r.runPrompt(ctx, target, prompt, r.snapshot(), started)
+}
+
+func (r *Runner) runPrompt(ctx context.Context, target config.Target, prompt string, settings runnerSettings, started time.Time) Result {
+	result := Result{ExitCode: ExitCodeUnavailable}
 
 	workspace, err := os.MkdirTemp("", "codex-queue-work-")
 	if err != nil {
@@ -122,8 +149,6 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 	_ = responseFile.Close()
 	defer os.Remove(responsePath)
 
-	requestID := newRequestID()
-	fullPrompt := fmt.Sprintf("%s\n\nAnswer concisely in at most 80 words. Do not inspect local files, run commands, browse, or use tools. Request ID: %s. Attempt: %d", prompt, requestID, attempt)
 	args := r.argsWithSettings(settings, target, workspace, responsePath, stdinPromptArg)
 
 	requestCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
@@ -131,14 +156,19 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 	cmd := exec.Command(settings.Binary, args...)
 	cmd.Dir = workspace
 	cmd.Env = r.codexEnvironment(os.Environ(), target.APIKey)
-	cmd.Stdin = strings.NewReader(fullPrompt)
+	cmd.Stdin = strings.NewReader(prompt)
 
 	output := newTailBuffer(maxOutputLen)
 	cmd.Stdout = output
 	cmd.Stderr = output
 	runErr := runCommand(requestCtx, cmd)
-	diagnostic := cleanDiagnostic(output.String())
-	diagnostic = redact(diagnostic, target.APIKey)
+	result.ProcessOutput = strings.TrimSpace(redact(output.String(), target.APIKey))
+	result.ExitCode = commandExitCode(cmd)
+	diagnostic := cleanDiagnostic(result.ProcessOutput)
+	response, responseErr := os.ReadFile(responsePath)
+	if responseErr == nil {
+		result.Response = strings.TrimSpace(string(response))
+	}
 	if requestCtx.Err() != nil {
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			result.Error = fmt.Sprintf("request timed out after %s", settings.Timeout)
@@ -157,13 +187,11 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 		return result
 	}
 
-	response, err := os.ReadFile(responsePath)
-	if err != nil {
-		result.Error = fmt.Sprintf("read Codex response: %v", err)
+	if responseErr != nil {
+		result.Error = fmt.Sprintf("read Codex response: %v", responseErr)
 		result.Duration = time.Since(started)
 		return result
 	}
-	result.Response = strings.TrimSpace(string(response))
 	if result.Response == "" {
 		result.Error = "Codex exited successfully but returned an empty final response"
 		if diagnostic != "" {
@@ -176,6 +204,13 @@ func (r *Runner) Run(ctx context.Context, target config.Target, attempt int) Res
 	result.Success = true
 	result.Duration = time.Since(started)
 	return result
+}
+
+func commandExitCode(cmd *exec.Cmd) int {
+	if cmd == nil || cmd.ProcessState == nil {
+		return ExitCodeUnavailable
+	}
+	return cmd.ProcessState.ExitCode()
 }
 
 func (r *Runner) codexEnvironment(base []string, apiKey string) []string {

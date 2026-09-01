@@ -41,6 +41,10 @@ type AttemptRunner interface {
 	Run(ctx context.Context, target config.Target, attempt int) codex.Result
 }
 
+type PromptRunner interface {
+	RunPrompt(ctx context.Context, target config.Target, prompt string) codex.Result
+}
+
 type Messenger interface {
 	Send(ctx context.Context, to, content, traceID string) error
 }
@@ -108,14 +112,20 @@ type KeepaliveSnapshot struct {
 }
 
 type TargetSnapshot struct {
-	ID        int64
-	SortOrder int
-	Name      string
-	Model     string
-	APIHost   string
-	Busy      bool
-	Queue     Snapshot
-	Keepalive KeepaliveSnapshot
+	ID           int64
+	SortOrder    int
+	Name         string
+	Model        string
+	APIHost      string
+	Busy         bool
+	AdhocRunning bool
+	Queue        Snapshot
+	Keepalive    KeepaliveSnapshot
+}
+
+type AdhocRunResult struct {
+	Target config.Target
+	Result codex.Result
 }
 
 type ManagerSnapshot struct {
@@ -160,6 +170,7 @@ type Manager struct {
 	slotsInUse       int
 	nextEventID      uint64
 	nextObserverID   uint64
+	nextAdhocRunID   uint64
 	observers        map[uint64]chan Event
 	runWG            sync.WaitGroup
 	shuttingDown     bool
@@ -202,18 +213,22 @@ const (
 	requestOwnerNone requestOwner = iota
 	requestOwnerQueue
 	requestOwnerKeepalive
+	requestOwnerAdhoc
 )
 
 type targetArbiter struct {
 	owner      requestOwner
 	ownerRunID uint64
+	cancel     context.CancelFunc
 	changed    chan struct{}
 }
 
 var (
-	ErrTargetBusy     = errors.New("target has an active queue or keepalive task")
-	ErrTargetNotFound = errors.New("target not found")
-	ErrTargetConflict = errors.New("target name already exists")
+	ErrTargetBusy       = errors.New("target has an active task")
+	ErrTargetNotFound   = errors.New("target not found")
+	ErrTargetConflict   = errors.New("target name already exists")
+	ErrAdhocUnavailable = errors.New("runner does not support adhoc prompts")
+	ErrShuttingDown     = errors.New("manager is shutting down")
 )
 
 func New(
@@ -385,6 +400,10 @@ func (m *Manager) stop(names []string) StopResult {
 		}
 		if keepalive.state != KeepaliveStateStopped || keepalive.workers > 0 {
 			m.stopKeepaliveLocked(key)
+			stopped = true
+		}
+		if m.arbiters[key].owner == requestOwnerAdhoc {
+			m.stopAdhocLocked(key)
 			stopped = true
 		}
 		if stopped {
@@ -577,6 +596,11 @@ func (m *Manager) BeginShutdown() {
 			current.cancel()
 		}
 	}
+	for _, arbiter := range m.arbiters {
+		if arbiter.owner == requestOwnerAdhoc && arbiter.cancel != nil {
+			arbiter.cancel()
+		}
+	}
 }
 
 func (m *Manager) Wait(ctx context.Context) error {
@@ -652,6 +676,85 @@ func (m *Manager) TargetByID(id int64) (config.Target, bool) {
 	return m.targets[key], true
 }
 
+// RunAdhoc reserves a target and one global process slot for a single
+// caller-supplied prompt. The request is exclusive with queue and keepalive
+// work on the same target and is included in shutdown/process accounting.
+func (m *Manager) RunAdhoc(ctx context.Context, id int64, prompt string) (AdhocRunResult, error) {
+	runner, ok := m.runner.(PromptRunner)
+	if !ok {
+		return AdhocRunResult{}, ErrAdhocUnavailable
+	}
+
+	started := time.Now()
+	m.mu.Lock()
+	key, ok := m.targetKeyByIDLocked(id)
+	if !ok {
+		m.mu.Unlock()
+		return AdhocRunResult{}, ErrTargetNotFound
+	}
+	if m.shuttingDown || m.root.Err() != nil {
+		m.mu.Unlock()
+		return AdhocRunResult{}, ErrShuttingDown
+	}
+	if m.targetBusyLocked(key) {
+		m.mu.Unlock()
+		return AdhocRunResult{}, ErrTargetBusy
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	stopRootCancel := context.AfterFunc(m.root, cancel)
+	m.nextAdhocRunID++
+	runID := m.nextAdhocRunID
+	target := m.targets[key]
+	arbiter := m.arbiters[key]
+	arbiter.owner = requestOwnerAdhoc
+	arbiter.ownerRunID = runID
+	arbiter.cancel = cancel
+	m.runWG.Add(1)
+	m.broadcastStateLocked()
+	m.mu.Unlock()
+
+	slotAcquired := false
+	processStarted := false
+	defer func() {
+		cancel()
+		stopRootCancel()
+		m.finishAdhocRequest(key, runID, slotAcquired, processStarted)
+	}()
+
+	cancelled := func() (AdhocRunResult, error) {
+		return AdhocRunResult{
+			Target: target,
+			Result: codex.Result{
+				ExitCode: codex.ExitCodeUnavailable,
+				Error:    "request cancelled",
+				Duration: time.Since(started),
+			},
+		}, nil
+	}
+	if !m.acquire(runCtx) {
+		return cancelled()
+	}
+	slotAcquired = true
+	if runCtx.Err() != nil {
+		return cancelled()
+	}
+
+	m.mu.Lock()
+	arbiter = m.arbiters[key]
+	if arbiter == nil || arbiter.owner != requestOwnerAdhoc || arbiter.ownerRunID != runID {
+		m.mu.Unlock()
+		return cancelled()
+	}
+	m.currentProcesses++
+	processStarted = true
+	m.broadcastStateLocked()
+	m.mu.Unlock()
+
+	result := runner.RunPrompt(runCtx, target, prompt)
+	return AdhocRunResult{Target: target, Result: result}, nil
+}
+
 // CreateTarget serializes persistence with target resolution so commands
 // cannot start a just-created target in a partially applied state.
 func (m *Manager) CreateTarget(target *config.Target, persist func() error) error {
@@ -696,6 +799,7 @@ func (m *Manager) UpdateTarget(id int64, target *config.Target, persist func() e
 	if m.targetBusyLocked(oldKey) {
 		m.stopQueueLocked(oldKey)
 		m.stopKeepaliveLocked(oldKey)
+		m.stopAdhocLocked(oldKey)
 		m.broadcastStateLocked()
 	}
 	m.mu.Unlock()
@@ -761,6 +865,7 @@ func (m *Manager) DeleteTarget(id int64, persist func() error) error {
 	if m.targetBusyLocked(key) {
 		m.stopQueueLocked(key)
 		m.stopKeepaliveLocked(key)
+		m.stopAdhocLocked(key)
 		m.broadcastStateLocked()
 	}
 	m.mu.Unlock()
@@ -806,7 +911,9 @@ func (m *Manager) targetKeyByIDLocked(id int64) (string, bool) {
 }
 
 func (m *Manager) targetBusyLocked(key string) bool {
-	return m.jobs[key].state == StateRunning || m.jobs[key].workers > 0 || m.keepalives[key].state != KeepaliveStateStopped || m.keepalives[key].workers > 0
+	return m.jobs[key].state == StateRunning || m.jobs[key].workers > 0 ||
+		m.keepalives[key].state != KeepaliveStateStopped || m.keepalives[key].workers > 0 ||
+		m.arbiters[key].owner != requestOwnerNone
 }
 
 // prepareMode enforces the one-mode-per-target invariant.  It is deliberately
@@ -822,6 +929,7 @@ func (m *Manager) prepareMode(key string, desired requestOwner) bool {
 		}
 		queue := m.jobs[key]
 		keepalive := m.keepalives[key]
+		arbiter := m.arbiters[key]
 		if desired == requestOwnerQueue && queue.state == StateRunning {
 			m.mu.Unlock()
 			return false
@@ -832,6 +940,10 @@ func (m *Manager) prepareMode(key string, desired requestOwner) bool {
 		}
 
 		changed := false
+		if arbiter.owner == requestOwnerAdhoc {
+			m.stopAdhocLocked(key)
+			changed = true
+		}
 		if desired == requestOwnerQueue && (keepalive.state != KeepaliveStateStopped || keepalive.workers > 0) {
 			m.stopKeepaliveLocked(key)
 			changed = true
@@ -895,6 +1007,18 @@ func (m *Manager) stopKeepaliveLocked(key string) {
 		current.nextRequest = time.Time{}
 	}
 	m.signalTargetLocked(key)
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (m *Manager) stopAdhocLocked(key string) {
+	arbiter, ok := m.arbiters[key]
+	if !ok || arbiter.owner != requestOwnerAdhoc {
+		return
+	}
+	cancel := arbiter.cancel
+	arbiter.cancel = nil
 	if cancel != nil {
 		cancel()
 	}
@@ -1017,14 +1141,15 @@ func (m *Manager) snapshotLocked() ManagerSnapshot {
 		queue := m.queueSnapshotLocked(key)
 		keepalive := m.keepaliveSnapshotLocked(key)
 		snapshot.Targets = append(snapshot.Targets, TargetSnapshot{
-			ID:        target.ID,
-			SortOrder: target.SortOrder,
-			Name:      queue.Name,
-			Model:     queue.Model,
-			APIHost:   queue.APIHost,
-			Busy:      m.targetBusyLocked(key),
-			Queue:     queue,
-			Keepalive: keepalive,
+			ID:           target.ID,
+			SortOrder:    target.SortOrder,
+			Name:         queue.Name,
+			Model:        queue.Model,
+			APIHost:      queue.APIHost,
+			Busy:         m.targetBusyLocked(key),
+			AdhocRunning: m.arbiters[key].owner == requestOwnerAdhoc,
+			Queue:        queue,
+			Keepalive:    keepalive,
 		})
 	}
 	return snapshot
@@ -1357,6 +1482,7 @@ func (m *Manager) releaseTargetLocked(key string, owner requestOwner, runID uint
 	}
 	arbiter.owner = requestOwnerNone
 	arbiter.ownerRunID = 0
+	arbiter.cancel = nil
 	m.signalTargetLocked(key)
 }
 
@@ -1457,6 +1583,26 @@ func (m *Manager) finishProcess() {
 	m.signalParallelLocked()
 	m.broadcastStateLocked()
 	m.mu.Unlock()
+}
+
+func (m *Manager) finishAdhocRequest(key string, runID uint64, slotAcquired, processStarted bool) {
+	m.mu.Lock()
+	if processStarted && m.currentProcesses > 0 {
+		m.currentProcesses--
+	}
+	if slotAcquired && m.slotsInUse > 0 {
+		m.slotsInUse--
+		m.signalParallelLocked()
+	}
+	if arbiter, ok := m.arbiters[key]; ok && arbiter.owner == requestOwnerAdhoc && arbiter.ownerRunID == runID {
+		arbiter.owner = requestOwnerNone
+		arbiter.ownerRunID = 0
+		arbiter.cancel = nil
+		m.signalTargetLocked(key)
+	}
+	m.broadcastStateLocked()
+	m.mu.Unlock()
+	m.runWG.Done()
 }
 
 func (m *Manager) releaseSlot() {

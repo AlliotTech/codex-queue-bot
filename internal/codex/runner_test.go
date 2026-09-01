@@ -196,8 +196,17 @@ func TestRunnerReportsExitFailureAndTimeout(t *testing.T) {
 		if result.Success || !strings.Contains(result.Error, "queue unavailable") {
 			t.Fatalf("result = %+v", result)
 		}
+		if result.ExitCode != 7 {
+			t.Fatalf("exit code = %d, want 7", result.ExitCode)
+		}
+		if !strings.Contains(result.ProcessOutput, "queue unavailable") {
+			t.Fatalf("process output = %q", result.ProcessOutput)
+		}
 		if strings.Contains(result.Error, "key=x") || !strings.Contains(result.Error, "[REDACTED]") {
 			t.Fatalf("secret was not redacted: %q", result.Error)
+		}
+		if strings.Contains(result.ProcessOutput, "key=x") || !strings.Contains(result.ProcessOutput, "[REDACTED]") {
+			t.Fatalf("process output secret was not redacted: %q", result.ProcessOutput)
 		}
 	})
 
@@ -212,6 +221,53 @@ func TestRunnerReportsExitFailureAndTimeout(t *testing.T) {
 			t.Fatalf("result = %+v", result)
 		}
 	})
+}
+
+func TestRunnerRunsCallerSuppliedPromptAndReturnsProcessDetails(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "adhoc-codex")
+	promptCapture := filepath.Join(dir, "prompt.txt")
+	body := `#!/bin/sh
+set -eu
+script_dir=${0%/*}
+cat > "$script_dir/prompt.txt"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--output-last-message" ]; then out="$arg"; fi
+  previous="$arg"
+done
+printf 'cli trace\n'
+printf 'adhoc answer' > "$out"
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{
+		Binary:          script,
+		PromptsFile:     filepath.Join(dir, "missing-prompts.txt"),
+		Timeout:         time.Second,
+		ReasoningEffort: "low",
+	}
+	target := config.Target{Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	prompt := "Explain this exact request.\nKeep the second line."
+	result := runner.RunPrompt(context.Background(), target, prompt)
+	if !result.Success || result.Response != "adhoc answer" || result.ExitCode != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.ProcessOutput != "cli trace" {
+		t.Fatalf("process output = %q", result.ProcessOutput)
+	}
+	captured, err := os.ReadFile(promptCapture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(captured) != prompt {
+		t.Fatalf("prompt = %q, want %q", captured, prompt)
+	}
+	if empty := runner.RunPrompt(context.Background(), target, " \n\t "); empty.Success || empty.ExitCode != ExitCodeUnavailable || !strings.Contains(empty.Error, "empty") {
+		t.Fatalf("empty prompt result = %+v", empty)
+	}
 }
 
 func TestTailBufferKeepsOnlyTheNewestBytes(t *testing.T) {

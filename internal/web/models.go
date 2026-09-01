@@ -43,13 +43,14 @@ type concurrencyResponse struct {
 }
 
 type targetResponse struct {
-	ID        int64             `json:"id"`
-	Name      string            `json:"name"`
-	Model     string            `json:"model"`
-	APIHost   string            `json:"api_host"`
-	Busy      bool              `json:"busy"`
-	Queue     queueResponse     `json:"queue"`
-	Keepalive keepaliveResponse `json:"keepalive"`
+	ID           int64             `json:"id"`
+	Name         string            `json:"name"`
+	Model        string            `json:"model"`
+	APIHost      string            `json:"api_host"`
+	Busy         bool              `json:"busy"`
+	AdhocRunning bool              `json:"adhoc_running"`
+	Queue        queueResponse     `json:"queue"`
+	Keepalive    keepaliveResponse `json:"keepalive"`
 }
 
 type queueResponse struct {
@@ -104,11 +105,12 @@ func (s *Server) statePayload(snapshot jobs.ManagerSnapshot, openILinkStatus, te
 	}
 	for _, target := range snapshot.Targets {
 		result.Targets = append(result.Targets, targetResponse{
-			ID:      target.ID,
-			Name:    target.Name,
-			Model:   target.Model,
-			APIHost: target.APIHost,
-			Busy:    target.Busy,
+			ID:           target.ID,
+			Name:         target.Name,
+			Model:        target.Model,
+			APIHost:      target.APIHost,
+			Busy:         target.Busy,
+			AdhocRunning: target.AdhocRunning,
 			Queue: queueResponse{
 				State:       target.Queue.State,
 				Attempts:    target.Queue.Attempts,

@@ -25,9 +25,12 @@ import (
 )
 
 type testRunner struct {
-	block bool
-	once  sync.Once
-	start chan struct{}
+	block       bool
+	once        sync.Once
+	start       chan struct{}
+	adhocMu     sync.Mutex
+	adhocPrompt string
+	adhocResult codex.Result
 }
 
 func (r *testRunner) Run(ctx context.Context, _ config.Target, _ int) codex.Result {
@@ -39,6 +42,22 @@ func (r *testRunner) Run(ctx context.Context, _ config.Target, _ int) codex.Resu
 	}
 	<-ctx.Done()
 	return codex.Result{Error: "cancelled"}
+}
+
+func (r *testRunner) RunPrompt(_ context.Context, _ config.Target, prompt string) codex.Result {
+	r.adhocMu.Lock()
+	defer r.adhocMu.Unlock()
+	r.adhocPrompt = prompt
+	if r.adhocResult == (codex.Result{}) {
+		return codex.Result{Success: true, Response: "ok", ExitCode: 0}
+	}
+	return r.adhocResult
+}
+
+func (r *testRunner) capturedAdhocPrompt() string {
+	r.adhocMu.Lock()
+	defer r.adhocMu.Unlock()
+	return r.adhocPrompt
 }
 
 type webFixture struct {
@@ -57,8 +76,8 @@ func newWebFixture(t *testing.T, runner *testRunner, mutate func(*Options)) webF
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	targets := []config.Target{
-		{Name: "main", APIBaseURL: "https://api.example.test/v1/private-path", APIKey: "super-secret-api-key", APIKeyEnv: "SECRET_ENV_NAME", Model: "gpt-test", WireAPI: "responses"},
-		{Name: "backup", APIBaseURL: "https://backup.example.test/v1", APIKey: "backup-secret", Model: "gpt-backup", WireAPI: "responses"},
+		{ID: 1, Name: "main", APIBaseURL: "https://api.example.test/v1/private-path", APIKey: "super-secret-api-key", APIKeyEnv: "SECRET_ENV_NAME", Model: "gpt-test", WireAPI: "responses"},
+		{ID: 2, Name: "backup", APIBaseURL: "https://backup.example.test/v1", APIKey: "backup-secret", Model: "gpt-backup", WireAPI: "responses"},
 	}
 	manager := jobs.New(ctx, targets, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 2, "开蹬", 200)
 	shutdown := make(chan struct{})
@@ -237,6 +256,50 @@ func TestDashboardAndAllActionsDoNotLeakSecrets(t *testing.T) {
 	if !strings.Contains(body, `"api_host":"api.example.test"`) || strings.Contains(body, `"source":"web"`) || strings.Contains(body, `"activities"`) {
 		t.Fatalf("dashboard public state/history shape: %s", body)
 	}
+}
+
+func TestAdhocRunReturnsOutputExitCodeAndRejectsBusyTarget(t *testing.T) {
+	runner := &testRunner{adhocResult: codex.Result{
+		Success: true, Response: "manual answer", ProcessOutput: "codex trace", ExitCode: 0, Duration: 1250 * time.Millisecond,
+	}}
+	fixture := newWebFixture(t, runner, nil)
+	cookie, _ := loginFixture(t, fixture.server)
+
+	response := performRequest(fixture.server, http.MethodPost, "/api/v1/targets/1/adhoc", `{"prompt":"  explain this\ncarefully  "}`, cookie, "192.0.2.1:1")
+	if response.Code != http.StatusOK {
+		t.Fatalf("adhoc status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result adhocRunResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.TargetID != 1 || result.Target != "main" || !result.Success || result.Output != "manual answer" || result.ProcessOutput != "codex trace" || result.ExitCode != 0 || result.DurationMS != 1250 {
+		t.Fatalf("adhoc response = %+v", result)
+	}
+	if got := runner.capturedAdhocPrompt(); got != "explain this\ncarefully" {
+		t.Fatalf("adhoc prompt = %q", got)
+	}
+	if invalid := performRequest(fixture.server, http.MethodPost, "/api/v1/targets/1/adhoc", `{"prompt":"  "}`, cookie, "192.0.2.1:1"); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("empty prompt status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	if missing := performRequest(fixture.server, http.MethodPost, "/api/v1/targets/999/adhoc", `{"prompt":"hello"}`, cookie, "192.0.2.1:1"); missing.Code != http.StatusNotFound {
+		t.Fatalf("missing target status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	blocking := &testRunner{block: true, start: make(chan struct{})}
+	busyFixture := newWebFixture(t, blocking, nil)
+	busyCookie, _ := loginFixture(t, busyFixture.server)
+	busyFixture.manager.Start([]string{"main"}, jobs.Subscriber{})
+	select {
+	case <-blocking.start:
+	case <-time.After(time.Second):
+		t.Fatal("queue runner did not start")
+	}
+	busy := performRequest(busyFixture.server, http.MethodPost, "/api/v1/targets/1/adhoc", `{"prompt":"hello"}`, busyCookie, "192.0.2.1:1")
+	if busy.Code != http.StatusConflict {
+		t.Fatalf("busy target status=%d body=%s", busy.Code, busy.Body.String())
+	}
+	busyFixture.manager.StopTask([]string{"main"})
 }
 
 func TestActionsRejectOversizedAndUnknownJSON(t *testing.T) {

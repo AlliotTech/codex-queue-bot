@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -126,6 +127,7 @@ func (r *immediateSequenceRunner) Run(_ context.Context, target config.Target, a
 type controlledCall struct {
 	target  string
 	attempt int
+	prompt  string
 	result  chan codex.Result
 	done    chan struct{}
 }
@@ -143,9 +145,18 @@ func newControlledRunner() *controlledRunner {
 }
 
 func (r *controlledRunner) Run(ctx context.Context, target config.Target, attempt int) codex.Result {
+	return r.run(ctx, target, attempt, "")
+}
+
+func (r *controlledRunner) RunPrompt(ctx context.Context, target config.Target, prompt string) codex.Result {
+	return r.run(ctx, target, 0, prompt)
+}
+
+func (r *controlledRunner) run(ctx context.Context, target config.Target, attempt int, prompt string) codex.Result {
 	call := &controlledCall{
 		target:  target.Name,
 		attempt: attempt,
+		prompt:  prompt,
 		result:  make(chan codex.Result, 1),
 		done:    make(chan struct{}),
 	}
@@ -167,7 +178,7 @@ func (r *controlledRunner) Run(ctx context.Context, target config.Target, attemp
 	case result := <-call.result:
 		return result
 	case <-ctx.Done():
-		return codex.Result{Error: "cancelled"}
+		return codex.Result{ExitCode: codex.ExitCodeUnavailable, Error: "cancelled"}
 	}
 }
 
@@ -218,6 +229,108 @@ func waitForCondition(t *testing.T, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for condition")
+}
+
+func TestAdhocRunReturnsResultTracksBusyStateAndCanBeStopped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	target := config.Target{ID: 1, Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
+	type outcome struct {
+		result AdhocRunResult
+		err    error
+	}
+
+	firstOutcome := make(chan outcome, 1)
+	go func() {
+		result, err := manager.RunAdhoc(context.Background(), 1, "manual prompt")
+		firstOutcome <- outcome{result: result, err: err}
+	}()
+	first := receiveControlledCall(t, runner)
+	if first.prompt != "manual prompt" || first.attempt != 0 {
+		t.Fatalf("adhoc call = %+v", first)
+	}
+	snapshot := manager.ComprehensiveSnapshot()
+	if snapshot.CurrentProcesses != 1 || !snapshot.Targets[0].Busy || !snapshot.Targets[0].AdhocRunning {
+		t.Fatalf("adhoc snapshot = %+v", snapshot)
+	}
+	if _, err := manager.RunAdhoc(context.Background(), 1, "second prompt"); !errors.Is(err, ErrTargetBusy) {
+		t.Fatalf("concurrent adhoc error = %v, want ErrTargetBusy", err)
+	}
+
+	want := codex.Result{Success: true, Response: "manual answer", ProcessOutput: "trace", ExitCode: 0}
+	first.result <- want
+	completed := <-firstOutcome
+	if completed.err != nil || completed.result.Target.Name != "main" || completed.result.Result != want {
+		t.Fatalf("adhoc outcome = %+v", completed)
+	}
+	waitForCondition(t, func() bool {
+		next := manager.ComprehensiveSnapshot()
+		return next.CurrentProcesses == 0 && !next.Targets[0].Busy && !next.Targets[0].AdhocRunning
+	})
+
+	secondOutcome := make(chan outcome, 1)
+	go func() {
+		result, err := manager.RunAdhoc(context.Background(), 1, "cancel me")
+		secondOutcome <- outcome{result: result, err: err}
+	}()
+	second := receiveControlledCall(t, runner)
+	stopped := manager.StopTask([]string{"main"})
+	if len(stopped.Stopped) != 1 || stopped.Stopped[0] != "main" {
+		t.Fatalf("stop adhoc result = %+v", stopped)
+	}
+	select {
+	case <-second.done:
+	case <-time.After(time.Second):
+		t.Fatal("adhoc runner was not cancelled")
+	}
+	cancelled := <-secondOutcome
+	if cancelled.err != nil || cancelled.result.Result.Success || cancelled.result.Result.ExitCode != codex.ExitCodeUnavailable || cancelled.result.Result.Error != "cancelled" {
+		t.Fatalf("cancelled adhoc outcome = %+v", cancelled)
+	}
+}
+
+func TestAdhocRunSharesGlobalConcurrencyWithQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newControlledRunner()
+	targets := []config.Target{
+		{ID: 1, Name: "queue", APIBaseURL: "https://queue.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"},
+		{ID: 2, Name: "adhoc", APIBaseURL: "https://adhoc.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"},
+	}
+	manager := New(ctx, targets, runner, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
+	manager.Start([]string{"queue"}, Subscriber{})
+	queueCall := receiveControlledCall(t, runner)
+
+	adhocDone := make(chan error, 1)
+	go func() {
+		_, err := manager.RunAdhoc(context.Background(), 2, "wait for a slot")
+		adhocDone <- err
+	}()
+	assertNoControlledCall(t, runner, 30*time.Millisecond)
+	queueCall.result <- codex.Result{Success: true, Response: "ok", ExitCode: 0}
+	adhocCall := receiveControlledCall(t, runner)
+	if adhocCall.target != "adhoc" || adhocCall.prompt != "wait for a slot" {
+		t.Fatalf("adhoc call after queue = %+v", adhocCall)
+	}
+	adhocCall.result <- codex.Result{Success: true, Response: "done", ExitCode: 0}
+	if err := <-adhocDone; err != nil {
+		t.Fatalf("RunAdhoc: %v", err)
+	}
+	if runner.maximumActive() != 1 {
+		t.Fatalf("maximum active requests = %d, want 1", runner.maximumActive())
+	}
+}
+
+func TestAdhocRunRequiresPromptCapableRunner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	target := config.Target{ID: 1, Name: "main", APIBaseURL: "https://api.example/v1", APIKey: "x", Model: "m", WireAPI: "responses"}
+	manager := New(ctx, []config.Target{target}, &sequenceRunner{}, nil, nil, time.Hour, time.Hour, time.Hour, time.Hour, 1, "ok")
+	if _, err := manager.RunAdhoc(context.Background(), 1, "prompt"); !errors.Is(err, ErrAdhocUnavailable) {
+		t.Fatalf("RunAdhoc error = %v, want ErrAdhocUnavailable", err)
+	}
 }
 
 func (r *blockingRunner) Run(ctx context.Context, _ config.Target, _ int) codex.Result {

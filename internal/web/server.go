@@ -29,9 +29,10 @@ import (
 )
 
 const (
-	sessionCookieName = "codex_queue_session"
-	defaultSessionTTL = 12 * time.Hour
-	maxJSONBody       = 64 << 10
+	sessionCookieName   = "codex_queue_session"
+	defaultSessionTTL   = 12 * time.Hour
+	maxJSONBody         = 64 << 10
+	maxAdhocPromptRunes = 32 << 10
 )
 
 type Options struct {
@@ -105,6 +106,10 @@ type actionRequest struct {
 	Targets []string `json:"targets"`
 }
 
+type adhocRunRequest struct {
+	Prompt string `json:"prompt"`
+}
+
 type sessionResponse struct {
 	Authenticated bool      `json:"authenticated"`
 	Username      string    `json:"username"`
@@ -115,6 +120,17 @@ type actionResponse struct {
 	Changed   []string `json:"changed"`
 	Unchanged []string `json:"unchanged"`
 	Unknown   []string `json:"unknown"`
+}
+
+type adhocRunResponse struct {
+	TargetID      int64  `json:"target_id"`
+	Target        string `json:"target"`
+	Success       bool   `json:"success"`
+	Output        string `json:"output"`
+	ProcessOutput string `json:"process_output"`
+	ExitCode      int    `json:"exit_code"`
+	Error         string `json:"error,omitempty"`
+	DurationMS    int64  `json:"duration_ms"`
 }
 
 func New(options Options) (*Server, error) {
@@ -237,6 +253,7 @@ func (s *Server) routes() {
 	authorized.PUT("/config/web", s.updateWebConfig)
 	authorized.PUT("/account", s.updateAccount)
 	authorized.POST("/targets", s.createTarget)
+	authorized.POST("/targets/:id/adhoc", s.runAdhoc)
 	authorized.PUT("/targets/:id", s.updateTarget)
 	authorized.DELETE("/targets/:id", s.deleteTarget)
 
@@ -356,6 +373,64 @@ func (s *Server) actions(c *gin.Context) {
 	response.Unchanged = nonNilStrings(response.Unchanged)
 	response.Unknown = nonNilStrings(response.Unknown)
 	c.JSON(http.StatusOK, response)
+}
+
+func (s *Server) runAdhoc(c *gin.Context) {
+	id, ok := parseTargetID(c)
+	if !ok {
+		return
+	}
+	var request adhocRunRequest
+	if err := decodeJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式不正确"})
+		return
+	}
+	prompt := strings.TrimSpace(request.Prompt)
+	if prompt == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Prompt 不能为空"})
+		return
+	}
+	if len([]rune(prompt)) > maxAdhocPromptRunes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Prompt 过长"})
+		return
+	}
+
+	outcome, err := s.manager.RunAdhoc(c.Request.Context(), id, prompt)
+	if err != nil {
+		switch {
+		case errors.Is(err, jobs.ErrTargetNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "target 不存在"})
+		case errors.Is(err, jobs.ErrTargetBusy):
+			c.JSON(http.StatusConflict, gin.H{"error": "target 当前有任务运行，请先停止后再执行手动请求"})
+		case errors.Is(err, jobs.ErrShuttingDown):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "服务正在停止，无法执行手动请求"})
+		case errors.Is(err, jobs.ErrAdhocUnavailable):
+			s.logger.Error("Codex runner does not support adhoc prompts")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "手动请求暂不可用"})
+		default:
+			s.logger.Error("adhoc Codex request failed to start", "target_id", id, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "手动请求启动失败"})
+		}
+		return
+	}
+	result := outcome.Result
+	s.logger.Info(
+		"Codex adhoc request finished",
+		"target", outcome.Target.Name,
+		"success", result.Success,
+		"exit_code", result.ExitCode,
+		"duration", result.Duration,
+	)
+	c.JSON(http.StatusOK, adhocRunResponse{
+		TargetID:      outcome.Target.ID,
+		Target:        outcome.Target.Name,
+		Success:       result.Success,
+		Output:        result.Response,
+		ProcessOutput: result.ProcessOutput,
+		ExitCode:      result.ExitCode,
+		Error:         result.Error,
+		DurationMS:    result.Duration.Milliseconds(),
+	})
 }
 
 func (s *Server) requireSession() gin.HandlerFunc {

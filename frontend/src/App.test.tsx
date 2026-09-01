@@ -26,7 +26,7 @@ const dashboard = {
   openilink: { state: "disabled", updated_at: null },
   telegram: { state: "disabled", updated_at: null },
   concurrency: { current: 0, max: 2 },
-  targets: [{ id: 1, name: "main", model: "gpt-test", api_host: "api.example.test", busy: false, queue: { state: "idle", attempts: 0, started_at: null, last_attempt: null, next_attempt: null, finished_at: null }, keepalive: { state: "stopped", requests: 0, started_at: null, last_request: null, last_success: null, last_failure: null, next_request: null, stopped_at: null } }],
+  targets: [{ id: 1, name: "main", model: "gpt-test", api_host: "api.example.test", busy: false, adhoc_running: false, queue: { state: "idle", attempts: 0, started_at: null, last_attempt: null, next_attempt: null, finished_at: null }, keepalive: { state: "stopped", requests: 0, started_at: null, last_request: null, last_success: null, last_failure: null, next_request: null, stopped_at: null } }],
 }
 
 const configuration = {
@@ -105,6 +105,30 @@ describe("console", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/v1/actions", expect.objectContaining({ method: "POST", body: JSON.stringify({ action: "queue.start", targets: ["main"] }) })))
     MockEventSource.instances[0].emit("state", { ...dashboard, targets: [{ ...dashboard.targets[0], busy: true, queue: { ...dashboard.targets[0].queue, state: "running", attempts: 1 } }] })
     expect(await screen.findByText("排队中")).toBeInTheDocument()
+  })
+
+  it("runs an adhoc prompt and displays output and exit code", async () => {
+    MockEventSource.instances = []
+    vi.stubGlobal("EventSource", MockEventSource)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith("/setup/status")) return publicStatus(false)
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, username: "admin", expires_at: "2026-08-21T00:00:00Z" }), { status: 200 })
+      if (url.endsWith("/dashboard")) return new Response(JSON.stringify(dashboard), { status: 200 })
+      if (url.endsWith("/targets/1/adhoc") && init?.method === "POST") return new Response(JSON.stringify({ target_id: 1, target: "main", success: true, output: "manual answer", process_output: "cli trace", exit_code: 0, duration_ms: 1234 }), { status: 200 })
+      throw new Error(`unexpected request ${url} ${init?.method}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    render(<App />)
+    await screen.findByText("main")
+    fireEvent.click(screen.getByRole("button", { name: "手动请求" }))
+    expect(await screen.findByText("手动请求 · main")).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "custom prompt" } })
+    fireEvent.click(screen.getByRole("button", { name: "执行请求" }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/v1/targets/1/adhoc", expect.objectContaining({ method: "POST", body: JSON.stringify({ prompt: "custom prompt" }) })))
+    expect(await screen.findByText("manual answer")).toBeInTheDocument()
+    expect(screen.getByText((_, element) => element?.textContent === "退出码 0")).toBeInTheDocument()
+    expect(screen.getByText("cli trace")).toBeInTheDocument()
   })
 
   it("creates a target from the configuration view without echoing a key", async () => {
